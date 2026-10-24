@@ -574,6 +574,7 @@ var configstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"add_warp_topic_discovery_min_requests_column"}, run: migrationAddWarpTopicDiscoveryMinRequestsColumn},
 	{IDs: []string{"add_azure_use_speech_endpoints_column"}, run: migrationAddAzureUseSpeechEndpointsColumn},
 	{IDs: []string{"add_azure_use_voice_live_endpoints_column"}, run: migrationAddAzureUseVoiceLiveEndpointsColumn},
+	{IDs: []string{"add_anthropic_workload_identity_column"}, run: migrationAddAnthropicWorkloadIdentityColumn},
 }
 
 // warpLogEmbeddingColumns are the semantic-search configuration columns added
@@ -16439,4 +16440,33 @@ func migrationAddAzureUseVoiceLiveEndpointsColumn(ctx context.Context, db *gorm.
 		return fmt.Errorf("error running %s migration: %w", migrationName, err)
 	}
 	return nil
+}
+
+// migrationAddAnthropicWorkloadIdentityColumn adds the anthropic_workload_identity_json column to
+// config_keys, holding an Anthropic key's encrypted anthropic_key_config.workload_identity block.
+func migrationAddAnthropicWorkloadIdentityColumn(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "add_anthropic_workload_identity_column"
+	logger.Info("[configstore] starting migration %s", migrationName)
+	defer logger.Info("[configstore] finished migration %s", migrationName)
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			if err := setMigrationLockTimeout(tx); err != nil {
+				return err
+			}
+			return addColumnIfNotExists(tx, logger, &tables.TableKey{}, "anthropic_workload_identity_json")
+		},
+		Rollback: rollbackAnthropicWorkloadIdentityColumn,
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running %s migration: %w", migrationName, err)
+	}
+	return nil
+}
+
+// rollbackAnthropicWorkloadIdentityColumn refuses, like the Vertex workload identity column: the
+// column may hold a literal identity token and the federation settings of every federated key.
+func rollbackAnthropicWorkloadIdentityColumn(*gorm.DB) error {
+	return fmt.Errorf("add_anthropic_workload_identity_column is non-rollbackable: dropping anthropic_workload_identity_json would permanently delete the workload identity configuration of every Anthropic key that uses it; the column is additive and older binaries safely ignore it")
 }

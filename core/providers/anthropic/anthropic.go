@@ -34,6 +34,9 @@ type AnthropicProvider struct {
 	sendBackRawRequest   bool                          // Whether to include raw request in BifrostResponse
 	sendBackRawResponse  bool                          // Whether to include raw response in BifrostResponse
 	customProviderConfig *schemas.CustomProviderConfig // Custom provider config
+
+	authHTTPClient           *http.Client // Client for workload identity token exchanges, routed through proxy_config
+	workloadIdentityTokenURL string       // Token exchange endpoint under the base URL
 }
 
 // anthropicMessageResponsePool provides a pool for Anthropic chat response objects.
@@ -121,6 +124,9 @@ func NewAnthropicProvider(config *schemas.ProviderConfig, logger schemas.Logger)
 		sendBackRawRequest:   config.SendBackRawRequest,
 		sendBackRawResponse:  config.SendBackRawResponse,
 		customProviderConfig: config.CustomProviderConfig,
+
+		authHTTPClient:           newWorkloadIdentityHTTPClient(config, logger),
+		workloadIdentityTokenURL: config.NetworkConfig.BaseURL + workloadIdentityTokenPath,
 	}
 }
 
@@ -181,16 +187,39 @@ func extractAnthropicResponsesUsageFromPrefetch(data []byte) *schemas.ResponsesR
 }
 
 // anthropicRequestHeaders builds the auth/version headers for an Anthropic request: the API
-// version plus x-api-key when a key is present and Claude Code max-mode is off. Shared by the
+// version plus the key's credential when a key is present and Claude Code max-mode is off. Shared by the
 // provider's unary (completeRequest / HandleAnthropic*Request) and streaming paths.
 func (provider *AnthropicProvider) anthropicRequestHeaders(ctx *schemas.BifrostContext, key schemas.Key) map[string]string {
 	headers := map[string]string{
 		"anthropic-version": provider.apiVersion,
 	}
 	if key.Value.GetValue() != "" && !IsClaudeCodeMaxMode(ctx) {
-		headers["x-api-key"] = key.Value.GetValue()
+		setKeyAuthHeaders(headers, key)
 	}
 	return headers
+}
+
+// setKeyAuthHeaders writes a resolved key's credential into a headers map: a workload identity
+// token as an OAuth bearer with the OAuth beta, which the request helpers merge into the computed
+// anthropic-beta, otherwise the static value as x-api-key.
+func setKeyAuthHeaders(headers map[string]string, key schemas.Key) {
+	if key.AnthropicKeyConfig.HasWorkloadIdentity() {
+		headers["Authorization"] = "Bearer " + key.Value.GetValue()
+		headers[AnthropicBetaHeader] = AnthropicOAuthBetaHeader
+		return
+	}
+	headers["x-api-key"] = key.Value.GetValue()
+}
+
+// setKeyAuth is setKeyAuthHeaders for a request built directly. Call it after anything that sets
+// anthropic-beta outright, since the OAuth beta is appended to whatever is there.
+func setKeyAuth(req *fasthttp.Request, key schemas.Key) {
+	if key.AnthropicKeyConfig.HasWorkloadIdentity() {
+		req.Header.Set("Authorization", "Bearer "+key.Value.GetValue())
+		appendBetaHeader(req, AnthropicOAuthBetaHeader)
+		return
+	}
+	req.Header.Set("x-api-key", key.Value.GetValue())
 }
 
 // completeRequest sends a non-streaming Anthropic Messages API request over fasthttp and
@@ -245,7 +274,12 @@ func completeRequest(
 	}
 
 	// Apply caller-supplied auth/version headers last so they win over network-config headers.
+	// An anthropic-beta among them (the OAuth beta a bearer needs) is merged, not replaced.
 	for key, value := range headers {
+		if key == AnthropicBetaHeader {
+			appendBetaHeader(req, value)
+			continue
+		}
 		req.Header.Set(key, value)
 	}
 
@@ -333,6 +367,12 @@ func completeRequest(
 // listModelsByKey performs a list models request for a single key.
 // Returns the response and latency, or an error if the request fails.
 func (provider *AnthropicProvider) listModelsByKey(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	// Resolved per key, so a key whose token cannot be minted fails its own listing and is
+	// reported in KeyStatuses like any other failing key.
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
+
 	// Create request
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
@@ -347,7 +387,7 @@ func (provider *AnthropicProvider) listModelsByKey(ctx *schemas.BifrostContext, 
 	req.Header.SetMethod(http.MethodGet)
 	req.Header.SetContentType("application/json")
 	if key.Value.GetValue() != "" {
-		req.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(req, key)
 	}
 	req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -363,7 +403,7 @@ func (provider *AnthropicProvider) listModelsByKey(ctx *schemas.BifrostContext, 
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, providerUtils.SetErrorLatency(ParseAnthropicError(resp), latency)
+		return nil, providerUtils.SetErrorLatency(provider.parseKeyError(key, resp), latency)
 	}
 
 	// Parse Anthropic's response
@@ -424,6 +464,9 @@ func (provider *AnthropicProvider) ModelRetrieve(ctx *schemas.BifrostContext, ke
 	if idErr != nil {
 		return nil, idErr
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	// Create request
 	req := fasthttp.AcquireRequest()
@@ -438,7 +481,7 @@ func (provider *AnthropicProvider) ModelRetrieve(ctx *schemas.BifrostContext, ke
 	req.Header.SetMethod(http.MethodGet)
 	req.Header.SetContentType("application/json")
 	if key.Value.GetValue() != "" {
-		req.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(req, key)
 	}
 	req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -455,7 +498,7 @@ func (provider *AnthropicProvider) ModelRetrieve(ctx *schemas.BifrostContext, ke
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, providerUtils.SetErrorLatency(ParseAnthropicError(resp), latency)
+		return nil, providerUtils.SetErrorLatency(provider.parseKeyError(key, resp), latency)
 	}
 
 	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
@@ -488,6 +531,9 @@ func (provider *AnthropicProvider) TextCompletion(ctx *schemas.BifrostContext, k
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.TextCompletionRequest); err != nil {
 		return nil, err
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	// Convert to Anthropic format using the centralized converter
 	jsonData, err := providerUtils.CheckContextAndGetRequestBody(
@@ -506,6 +552,7 @@ func (provider *AnthropicProvider) TextCompletion(ctx *schemas.BifrostContext, k
 		ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, providerResponseHeaders)
 	}
 	if err != nil {
+		provider.dropRejectedTokenOnError(key, err)
 		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse, latency)
 	}
 
@@ -566,7 +613,10 @@ func (provider *AnthropicProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.ChatCompletionRequest); err != nil {
 		return nil, err
 	}
-	return HandleAnthropicChatCompletionRequest(
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
+	response, bifrostErr := HandleAnthropicChatCompletionRequest(
 		ctx,
 		provider.client,
 		provider.buildRequestURL(ctx, "/v1/messages", schemas.ChatCompletionRequest),
@@ -583,6 +633,8 @@ func (provider *AnthropicProvider) ChatCompletion(ctx *schemas.BifrostContext, k
 		nil,
 		provider.logger,
 	)
+	provider.dropRejectedTokenOnError(key, bifrostErr)
+	return response, bifrostErr
 }
 
 // HandleAnthropicChatCompletionRequest builds the Anthropic Messages chat request body from
@@ -664,6 +716,9 @@ func (provider *AnthropicProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.ChatCompletionStreamRequest); err != nil {
 		return nil, err
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	jsonData, bifrostErr := BuildAnthropicChatRequestBody(ctx, request, AnthropicRequestBuildConfig{
 		Provider:                  schemas.Anthropic,
@@ -684,11 +739,11 @@ func (provider *AnthropicProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 	}
 
 	if key.Value.GetValue() != "" && !IsClaudeCodeMaxMode(ctx) {
-		headers["x-api-key"] = key.Value.GetValue()
+		setKeyAuthHeaders(headers, key)
 	}
 
 	// Use shared Anthropic streaming logic
-	return HandleAnthropicChatCompletionStreaming(
+	stream, bifrostErr := HandleAnthropicChatCompletionStreaming(
 		ctx,
 		provider.streamingClient,
 		provider.buildRequestURL(ctx, "/v1/messages", schemas.ChatCompletionStreamRequest),
@@ -706,6 +761,8 @@ func (provider *AnthropicProvider) ChatCompletionStream(ctx *schemas.BifrostCont
 		provider.logger,
 		postHookSpanFinalizer,
 	)
+	provider.dropRejectedTokenOnError(key, bifrostErr)
+	return stream, bifrostErr
 }
 
 // normalizeCachedUsage folds the accumulated cached read/write token counts into
@@ -906,7 +963,12 @@ func HandleAnthropicChatCompletionStreaming(
 		req.Header.Del(AnthropicBetaHeader)
 	}
 
+	// An anthropic-beta among the caller's headers (the OAuth beta a bearer needs) is merged, not replaced.
 	for key, value := range headers {
+		if key == AnthropicBetaHeader {
+			appendBetaHeader(req, value)
+			continue
+		}
 		req.Header.Set(key, value)
 	}
 
@@ -1399,7 +1461,10 @@ func (provider *AnthropicProvider) Responses(ctx *schemas.BifrostContext, key sc
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.ResponsesRequest); err != nil {
 		return nil, err
 	}
-	return HandleAnthropicResponsesRequest(
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
+	response, bifrostErr := HandleAnthropicResponsesRequest(
 		ctx,
 		provider.client,
 		provider.buildRequestURL(ctx, "/v1/messages", schemas.ResponsesRequest),
@@ -1416,6 +1481,8 @@ func (provider *AnthropicProvider) Responses(ctx *schemas.BifrostContext, key sc
 		nil,
 		provider.logger,
 	)
+	provider.dropRejectedTokenOnError(key, bifrostErr)
+	return response, bifrostErr
 }
 
 // HandleAnthropicResponsesRequest is the Responses-API analogue of
@@ -1502,6 +1569,9 @@ func (provider *AnthropicProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.ResponsesStreamRequest); err != nil {
 		return nil, err
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	jsonBody, err := BuildAnthropicResponsesRequestBody(ctx, request, AnthropicRequestBuildConfig{
 		Provider:                  schemas.Anthropic,
@@ -1522,10 +1592,10 @@ func (provider *AnthropicProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 	}
 
 	if key.Value.GetValue() != "" && !IsClaudeCodeMaxMode(ctx) {
-		headers["x-api-key"] = key.Value.GetValue()
+		setKeyAuthHeaders(headers, key)
 	}
 
-	return HandleAnthropicResponsesStream(
+	stream, bifrostErr := HandleAnthropicResponsesStream(
 		ctx,
 		provider.streamingClient,
 		provider.buildRequestURL(ctx, "/v1/messages", schemas.ResponsesStreamRequest),
@@ -1543,6 +1613,8 @@ func (provider *AnthropicProvider) ResponsesStream(ctx *schemas.BifrostContext, 
 		provider.logger,
 		postHookSpanFinalizer,
 	)
+	provider.dropRejectedTokenOnError(key, bifrostErr)
+	return stream, bifrostErr
 }
 
 // HandleAnthropicResponsesStream handles streaming for Anthropic-compatible APIs.
@@ -1586,8 +1658,13 @@ func HandleAnthropicResponsesStream(
 		req.Header.Del(AnthropicBetaHeader)
 	}
 
-	// Set auth/static headers, applied after extra headers so they always win
+	// Set auth/static headers, applied after extra headers so they always win; an anthropic-beta
+	// among them (the OAuth beta a bearer needs) is merged, not replaced.
 	for key, value := range headers {
+		if key == AnthropicBetaHeader {
+			appendBetaHeader(req, value)
+			continue
+		}
 		req.Header.Set(key, value)
 	}
 
@@ -1972,6 +2049,9 @@ func (provider *AnthropicProvider) BatchCreate(ctx *schemas.BifrostContext, key 
 	if len(request.Requests) == 0 {
 		return nil, providerUtils.NewBifrostOperationError("requests array is required for Anthropic batch API", nil)
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	// Create request
 	req := fasthttp.AcquireRequest()
@@ -1986,7 +2066,7 @@ func (provider *AnthropicProvider) BatchCreate(ctx *schemas.BifrostContext, key 
 	req.Header.SetContentType("application/json")
 
 	if key.Value.GetValue() != "" {
-		req.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(req, key)
 	}
 	req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -2028,7 +2108,7 @@ func (provider *AnthropicProvider) BatchCreate(ctx *schemas.BifrostContext, key 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
 		provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-		return nil, providerUtils.SetErrorLatency(ParseAnthropicError(resp), latency)
+		return nil, providerUtils.SetErrorLatency(provider.parseKeyError(key, resp), latency)
 	}
 
 	body, err := providerUtils.CheckAndDecodeBody(resp)
@@ -2071,6 +2151,11 @@ func (provider *AnthropicProvider) BatchList(ctx *schemas.BifrostContext, keys [
 			HasMore: false,
 		}, nil
 	}
+	// Resolve only the key the cursor selects: the cursor stores a position, so filtering
+	// failed federated keys out first would shift every later key and misdirect saved cursors.
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	// Create request
 	req := fasthttp.AcquireRequest()
@@ -2103,7 +2188,7 @@ func (provider *AnthropicProvider) BatchList(ctx *schemas.BifrostContext, keys [
 	req.Header.SetContentType("application/json")
 
 	if key.Value.GetValue() != "" {
-		req.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(req, key)
 	}
 	req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -2117,7 +2202,7 @@ func (provider *AnthropicProvider) BatchList(ctx *schemas.BifrostContext, keys [
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
 		provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-		return nil, providerUtils.SetErrorLatency(ParseAnthropicError(resp), latency)
+		return nil, providerUtils.SetErrorLatency(provider.parseKeyError(key, resp), latency)
 	}
 
 	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
@@ -2180,6 +2265,12 @@ func (provider *AnthropicProvider) BatchRetrieve(ctx *schemas.BifrostContext, ke
 
 	var lastErr *schemas.BifrostError
 	for _, key := range keys {
+		// Minted only when the loop reaches it, so a working earlier key never waits on this
+		// key's token endpoint; a mint failure is this key's error and the next key is tried.
+		if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+			lastErr = keyErr
+			continue
+		}
 		// Create request
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
@@ -2195,7 +2286,7 @@ func (provider *AnthropicProvider) BatchRetrieve(ctx *schemas.BifrostContext, ke
 		req.Header.SetContentType("application/json")
 
 		if key.Value.GetValue() != "" {
-			req.Header.Set("x-api-key", key.Value.GetValue())
+			setKeyAuth(req, key)
 		}
 		req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -2212,7 +2303,7 @@ func (provider *AnthropicProvider) BatchRetrieve(ctx *schemas.BifrostContext, ke
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
 			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-			lastErr = ParseAnthropicError(resp)
+			lastErr = provider.parseKeyError(key, resp)
 			wait()
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -2270,6 +2361,12 @@ func (provider *AnthropicProvider) BatchCancel(ctx *schemas.BifrostContext, keys
 
 	var lastErr *schemas.BifrostError
 	for _, key := range keys {
+		// Minted only when the loop reaches it, so a working earlier key never waits on this
+		// key's token endpoint; a mint failure is this key's error and the next key is tried.
+		if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+			lastErr = keyErr
+			continue
+		}
 		// Create request
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
@@ -2281,7 +2378,7 @@ func (provider *AnthropicProvider) BatchCancel(ctx *schemas.BifrostContext, keys
 		req.Header.SetContentType("application/json")
 
 		if key.Value.GetValue() != "" {
-			req.Header.Set("x-api-key", key.Value.GetValue())
+			setKeyAuth(req, key)
 		}
 		req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -2298,7 +2395,7 @@ func (provider *AnthropicProvider) BatchCancel(ctx *schemas.BifrostContext, keys
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
 			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-			lastErr = ParseAnthropicError(resp)
+			lastErr = provider.parseKeyError(key, resp)
 			wait()
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -2387,6 +2484,12 @@ func (provider *AnthropicProvider) BatchResults(ctx *schemas.BifrostContext, key
 
 	var lastErr *schemas.BifrostError
 	for _, key := range keys {
+		// Minted only when the loop reaches it, so a working earlier key never waits on this
+		// key's token endpoint; a mint failure is this key's error and the next key is tried.
+		if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+			lastErr = keyErr
+			continue
+		}
 		// Create request
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
@@ -2397,7 +2500,7 @@ func (provider *AnthropicProvider) BatchResults(ctx *schemas.BifrostContext, key
 		req.Header.SetMethod(http.MethodGet)
 
 		if key.Value.GetValue() != "" {
-			req.Header.Set("x-api-key", key.Value.GetValue())
+			setKeyAuth(req, key)
 		}
 		req.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -2414,7 +2517,7 @@ func (provider *AnthropicProvider) BatchResults(ctx *schemas.BifrostContext, key
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
 			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-			lastErr = ParseAnthropicError(resp)
+			lastErr = provider.parseKeyError(key, resp)
 			wait()
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -2563,6 +2666,9 @@ func (provider *AnthropicProvider) FileUpload(ctx *schemas.BifrostContext, key s
 	if len(request.File) == 0 {
 		return nil, providerUtils.NewBifrostOperationError("file content is required", nil)
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	// Create multipart form data
 	var buf bytes.Buffer
@@ -2618,7 +2724,7 @@ func (provider *AnthropicProvider) FileUpload(ctx *schemas.BifrostContext, key s
 	req.Header.SetContentType(writer.FormDataContentType())
 
 	if key.Value.GetValue() != "" {
-		req.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(req, key)
 	}
 	req.Header.Set("anthropic-version", provider.apiVersion)
 	appendBetaHeader(req, AnthropicFilesAPIBetaHeader)
@@ -2634,7 +2740,7 @@ func (provider *AnthropicProvider) FileUpload(ctx *schemas.BifrostContext, key s
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusCreated {
 		provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-		return nil, providerUtils.SetErrorLatency(ParseAnthropicError(resp), latency)
+		return nil, providerUtils.SetErrorLatency(provider.parseKeyError(key, resp), latency)
 	}
 
 	body, err := providerUtils.CheckAndDecodeBody(resp)
@@ -2681,6 +2787,11 @@ func (provider *AnthropicProvider) FileList(ctx *schemas.BifrostContext, keys []
 			HasMore: false,
 		}, nil
 	}
+	// Resolve only the key the cursor selects: the cursor stores a position, so filtering
+	// failed federated keys out first would shift every later key and misdirect saved cursors.
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	// Create request
 	req := fasthttp.AcquireRequest()
@@ -2709,7 +2820,7 @@ func (provider *AnthropicProvider) FileList(ctx *schemas.BifrostContext, keys []
 	req.Header.SetContentType("application/json")
 
 	if key.Value.GetValue() != "" {
-		req.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(req, key)
 	}
 	req.Header.Set("anthropic-version", provider.apiVersion)
 	appendBetaHeader(req, AnthropicFilesAPIBetaHeader)
@@ -2724,7 +2835,7 @@ func (provider *AnthropicProvider) FileList(ctx *schemas.BifrostContext, keys []
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
 		provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-		return nil, providerUtils.SetErrorLatency(ParseAnthropicError(resp), latency)
+		return nil, providerUtils.SetErrorLatency(provider.parseKeyError(key, resp), latency)
 	}
 
 	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
@@ -2797,6 +2908,12 @@ func (provider *AnthropicProvider) FileRetrieve(ctx *schemas.BifrostContext, key
 
 	var lastErr *schemas.BifrostError
 	for _, key := range keys {
+		// Minted only when the loop reaches it, so a working earlier key never waits on this
+		// key's token endpoint; a mint failure is this key's error and the next key is tried.
+		if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+			lastErr = keyErr
+			continue
+		}
 		// Create request
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
@@ -2812,7 +2929,7 @@ func (provider *AnthropicProvider) FileRetrieve(ctx *schemas.BifrostContext, key
 		req.Header.SetContentType("application/json")
 
 		if key.Value.GetValue() != "" {
-			req.Header.Set("x-api-key", key.Value.GetValue())
+			setKeyAuth(req, key)
 		}
 		req.Header.Set("anthropic-version", provider.apiVersion)
 		appendBetaHeader(req, AnthropicFilesAPIBetaHeader)
@@ -2830,7 +2947,7 @@ func (provider *AnthropicProvider) FileRetrieve(ctx *schemas.BifrostContext, key
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
 			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-			lastErr = ParseAnthropicError(resp)
+			lastErr = provider.parseKeyError(key, resp)
 			wait()
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -2887,6 +3004,12 @@ func (provider *AnthropicProvider) FileDelete(ctx *schemas.BifrostContext, keys 
 
 	var lastErr *schemas.BifrostError
 	for _, key := range keys {
+		// Minted only when the loop reaches it, so a working earlier key never waits on this
+		// key's token endpoint; a mint failure is this key's error and the next key is tried.
+		if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+			lastErr = keyErr
+			continue
+		}
 		// Create request
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
@@ -2898,7 +3021,7 @@ func (provider *AnthropicProvider) FileDelete(ctx *schemas.BifrostContext, keys 
 		req.Header.SetContentType("application/json")
 
 		if key.Value.GetValue() != "" {
-			req.Header.Set("x-api-key", key.Value.GetValue())
+			setKeyAuth(req, key)
 		}
 		req.Header.Set("anthropic-version", provider.apiVersion)
 		appendBetaHeader(req, AnthropicFilesAPIBetaHeader)
@@ -2916,7 +3039,7 @@ func (provider *AnthropicProvider) FileDelete(ctx *schemas.BifrostContext, keys 
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusNoContent {
 			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-			lastErr = ParseAnthropicError(resp)
+			lastErr = provider.parseKeyError(key, resp)
 			wait()
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -3003,6 +3126,12 @@ func (provider *AnthropicProvider) FileContent(ctx *schemas.BifrostContext, keys
 
 	var lastErr *schemas.BifrostError
 	for _, key := range keys {
+		// Minted only when the loop reaches it, so a working earlier key never waits on this
+		// key's token endpoint; a mint failure is this key's error and the next key is tried.
+		if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+			lastErr = keyErr
+			continue
+		}
 		// Create request
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
@@ -3013,7 +3142,7 @@ func (provider *AnthropicProvider) FileContent(ctx *schemas.BifrostContext, keys
 		req.Header.SetMethod(http.MethodGet)
 
 		if key.Value.GetValue() != "" {
-			req.Header.Set("x-api-key", key.Value.GetValue())
+			setKeyAuth(req, key)
 		}
 		req.Header.Set("anthropic-version", provider.apiVersion)
 		appendBetaHeader(req, AnthropicFilesAPIBetaHeader)
@@ -3030,7 +3159,7 @@ func (provider *AnthropicProvider) FileContent(ctx *schemas.BifrostContext, keys
 		// Handle error response
 		if resp.StatusCode() != fasthttp.StatusOK {
 			provider.logger.Debug("error from %s provider: status %d", providerName, resp.StatusCode())
-			lastErr = ParseAnthropicError(resp)
+			lastErr = provider.parseKeyError(key, resp)
 			wait()
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -3075,7 +3204,10 @@ func (provider *AnthropicProvider) CountTokens(ctx *schemas.BifrostContext, key 
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.CountTokensRequest); err != nil {
 		return nil, err
 	}
-	return HandleAnthropicCountTokensRequest(
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
+	response, bifrostErr := HandleAnthropicCountTokensRequest(
 		ctx,
 		provider.client,
 		provider.buildRequestURL(ctx, "/v1/messages/count_tokens", schemas.CountTokensRequest),
@@ -3094,6 +3226,8 @@ func (provider *AnthropicProvider) CountTokens(ctx *schemas.BifrostContext, key 
 		nil,
 		provider.logger,
 	)
+	provider.dropRejectedTokenOnError(key, bifrostErr)
+	return response, bifrostErr
 }
 
 // HandleAnthropicCountTokensRequest counts tokens for a Responses-shaped request against an
@@ -3250,6 +3384,9 @@ func (provider *AnthropicProvider) Passthrough(
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.PassthroughRequest); err != nil {
 		return nil, err
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	url, err := providerUtils.BuildPassthroughURL(provider.networkConfig.BaseURL, req.Path, req.RawQuery)
 	if err != nil {
@@ -3272,7 +3409,7 @@ func (provider *AnthropicProvider) Passthrough(
 	}
 
 	if key.Value.GetValue() != "" {
-		fasthttpReq.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(fasthttpReq, key)
 	}
 	fasthttpReq.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -3286,6 +3423,7 @@ func (provider *AnthropicProvider) Passthrough(
 
 	headers := providerUtils.ExtractPassthroughProviderResponseHeaders(resp)
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, headers)
+	provider.dropRejectedToken(key, resp.StatusCode())
 
 	body, err := providerUtils.CheckAndDecodeBody(resp)
 	if err != nil {
@@ -3322,6 +3460,9 @@ func (provider *AnthropicProvider) PassthroughStream(
 	if err := providerUtils.CheckOperationAllowed(schemas.Anthropic, provider.customProviderConfig, schemas.PassthroughStreamRequest); err != nil {
 		return nil, err
 	}
+	if keyErr := provider.resolveKey(ctx, &key); keyErr != nil {
+		return nil, keyErr
+	}
 
 	url, err := providerUtils.BuildPassthroughURL(provider.networkConfig.BaseURL, req.Path, req.RawQuery)
 	if err != nil {
@@ -3348,7 +3489,7 @@ func (provider *AnthropicProvider) PassthroughStream(
 	fasthttpReq.Header.Set("Connection", "close")
 
 	if key.Value.GetValue() != "" {
-		fasthttpReq.Header.Set("x-api-key", key.Value.GetValue())
+		setKeyAuth(fasthttpReq, key)
 	}
 	fasthttpReq.Header.Set("anthropic-version", provider.apiVersion)
 
@@ -3377,6 +3518,7 @@ func (provider *AnthropicProvider) PassthroughStream(
 
 	headers := providerUtils.ExtractPassthroughProviderResponseHeaders(resp)
 	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, headers)
+	provider.dropRejectedToken(key, resp.StatusCode())
 
 	bodyStream := resp.BodyStream()
 	if bodyStream == nil {

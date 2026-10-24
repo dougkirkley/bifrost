@@ -213,6 +213,22 @@ func (c *Cache[T]) Invalidate(cacheKey string) {
 	}
 }
 
+// InvalidateEntry discards the cached token for cacheKey only while the slot still holds e, in one
+// atomic step, so a caller reacting to a rejection of e never clears a newer token that a
+// concurrent refresh stored meanwhile. Unlike Invalidate it leaves an in-flight refresh alone
+// rather than making it discard its result and mint again: for a credential that is accepted only
+// once, that second mint would present it twice. Reports whether e was discarded.
+func (c *Cache[T]) InvalidateEntry(cacheKey string, e *Entry[T]) bool {
+	if e == nil {
+		return false
+	}
+	s, ok := c.slots.Load(cacheKey)
+	if !ok {
+		return false
+	}
+	return s.(*slot[T]).entry.CompareAndSwap(e, nil)
+}
+
 // Expire marks the cached token for cacheKey as due for refresh but keeps its value, so the
 // next mint receives it as prev and can reuse whatever parts are still valid.
 func (c *Cache[T]) Expire(cacheKey string) {
