@@ -779,13 +779,30 @@ func registerDynamicClient(ctx context.Context, registrationURL, redirectURI str
 // ClientName is Bifrost's client_name in DCR and its Client ID Metadata Document.
 const ClientName = "Bifrost MCP Gateway"
 
+// IsClientMetadataURL reports whether clientID is a Client ID Metadata Document URL.
+func IsClientMetadataURL(clientID string) bool {
+	if !strings.HasPrefix(clientID, "https://") {
+		return false
+	}
+	u, err := url.Parse(clientID)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || strings.Contains(clientID, "#") {
+		return false
+	}
+	if u.Path == "" || u.Path == "/" {
+		return false
+	}
+	// Only dot segments are refused; trailing and doubled slashes are valid (u.Path is decoded).
+	for _, segment := range strings.Split(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // clientMetadataDocumentID returns documentURL if it can be used as the client_id, else "".
 func clientMetadataDocumentID(documentURL string, supported bool) string {
-	if !supported || documentURL == "" {
-		return ""
-	}
-	u, err := url.Parse(documentURL)
-	if err != nil || u.Scheme != "https" || u.Path == "" || u.Path == "/" || ApplicationTypeFor(documentURL) == "native" {
+	if !supported || !IsClientMetadataURL(documentURL) || ApplicationTypeFor(documentURL) == "native" {
 		return ""
 	}
 	return documentURL
