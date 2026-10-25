@@ -8858,6 +8858,7 @@ type MCPOAuthConfigFields struct {
 	RegistrationURL string // "" means no registration URL stored (maps to a nil *string on the row)
 	Resource        string
 	Scopes          []string
+	RedirectURI     string // "" keeps the stored redirect_uri
 }
 
 // DiffersFrom reports whether ANY field in fields differs from what's
@@ -8892,6 +8893,7 @@ func (fields MCPOAuthConfigFields) DiffersFrom(existingOauthConfig *tables.Table
 		fields.TokenURL != existingOauthConfig.TokenURL ||
 		fields.RegistrationURL != existingRegistrationURL ||
 		fields.Resource != existingOauthConfig.Resource ||
+		(fields.RedirectURI != "" && fields.RedirectURI != existingOauthConfig.RedirectURI) ||
 		!slices.Equal(newScopesSorted, existingScopesSorted)
 }
 
@@ -8939,6 +8941,9 @@ func (s *RDBConfigStore) RotateMCPOAuthConfig(ctx context.Context, existingOauth
 		existingOauthConfig.RegistrationURL = &registrationURL
 	}
 	existingOauthConfig.Resource = fields.Resource
+	if fields.RedirectURI != "" {
+		existingOauthConfig.RedirectURI = fields.RedirectURI
+	}
 	if len(fields.Scopes) == 0 {
 		existingOauthConfig.Scopes = ""
 	} else {

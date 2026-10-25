@@ -17,6 +17,7 @@ What Bifrost handles for you:
 
 - **Automatic token refresh** before expiration
 - **PKCE** for public clients (no client secret)
+- **Client ID Metadata Documents**, so Bifrost can sign in without registering a client first
 - **Dynamic Client Registration** (RFC 7591)
 - **OAuth discovery** from server URLs (`.well-known/oauth-authorization-server`, `.well-known/openid-configuration`)
 - **Secure token storage** (encrypted at rest)
@@ -56,7 +57,8 @@ sequenceDiagram
 2. Pick **HTTP** or **SSE** as the connection type, fill in the **Connection URL**
 3. Set **Auth Type** to **OAuth 2.0**
 4. Fill in the OAuth fields:
-   - **Client ID** (optional — leave blank for Dynamic Client Registration)
+   - **Client ID** (optional — leave blank and Bifrost registers itself, through its [client metadata document](#client-id-metadata-documents) or [Dynamic Client Registration](#dynamic-client-registration-rfc-7591))
+   - **Use Bifrost's client metadata document** (off by default — turn on to use the document even when the server does not advertise support; see [below](#client-id-metadata-documents))
    - **Client Secret** (optional — omit for PKCE public clients)
    - **Authorize URL** (optional — leave blank to use OAuth discovery)
    - **Token URL** (optional — same)
@@ -182,6 +184,32 @@ For applications without a client secret, omit `client_secret` and Bifrost will 
   }
 }
 ```
+
+---
+
+## Client ID Metadata Documents
+
+Bifrost publishes a client metadata document describing itself: its name, the redirect URI it signs in with, and that it is a public client with no secret. An authorization server that supports these documents accepts the document's address as the client ID and reads it during sign-in, so nothing has to be registered beforehand and there is no client secret to manage.
+
+When **Client ID** is left blank, Bifrost uses its document automatically wherever the authorization server advertises support, and falls back to [Dynamic Client Registration](#dynamic-client-registration-rfc-7591) otherwise.
+
+Turn on **Use Bifrost's client metadata document** (`"use_client_metadata_document": true` in `oauth_config`) to use the document even when the authorization server does not advertise support, for example when its endpoints cannot be discovered and you enter them by hand:
+
+```json
+{
+  "oauth_config": {
+    "authorize_url": "https://auth.example.com/oauth/authorize",
+    "token_url": "https://auth.example.com/oauth/token",
+    "use_client_metadata_document": true
+  }
+}
+```
+
+- The authorization server has to fetch the document from Bifrost, so Bifrost must be reachable over public HTTPS. Set [`mcp_external_client_url`](#public-url-configuration) if Bifrost sits behind a proxy; on a local or plain-HTTP address the setting is refused when you save the client.
+- It replaces the client ID and secret, so it cannot be combined with a **Client ID**.
+- The authorization server must actually accept client metadata documents. If it does not, sign-in fails on its page; turn the setting off and use a client ID or Dynamic Client Registration instead.
+
+If Bifrost's public address changes later, the client ID moves to the document at the new address on the next sign-in, and existing sessions have to sign in again.
 
 ---
 
