@@ -1297,7 +1297,11 @@ func (m *MCPManager) verifyPerUserOAuthConnection(ctx context.Context, config *s
 	}
 
 	snapshot := &schemas.MCPServerSnapshot{Tools: tools, ToolNameMapping: toolNameMapping, Instructions: serverInstructions}
-	m.listResourcesAndPrompts(verifyCtx, eachList, tempClient, config.Name, tempClient.GetServerCapabilities(), snapshot, m.installedSnapshotByID(config.ID))
+	// Without tools, tools/list never reached the server; its resources and prompts lists did.
+	caps := tempClient.GetServerCapabilities()
+	if err := m.listResourcesAndPrompts(verifyCtx, eachList, tempClient, config.Name, caps, snapshot, m.installedSnapshotByID(config.ID)); err != nil && caps.Tools == nil {
+		return nil, fmt.Errorf("failed to list the server's resources and prompts during verification: %w", err)
+	}
 
 	m.logger.Info("%s Per-user OAuth verification succeeded for '%s': discovered %d tools", MCPLogPrefix, config.Name, len(tools))
 	return snapshot, nil
@@ -1478,7 +1482,11 @@ func (m *MCPManager) verifyHeadersConnection(ctx context.Context, config *schema
 	}
 
 	snapshot := &schemas.MCPServerSnapshot{Tools: tools, ToolNameMapping: toolNameMapping, Instructions: serverInstructions}
-	m.listResourcesAndPrompts(verifyCtx, eachList, tempClient, config.Name, tempClient.GetServerCapabilities(), snapshot, m.installedSnapshotByID(config.ID))
+	// Without tools, tools/list never reached the server; its resources and prompts lists did.
+	caps := tempClient.GetServerCapabilities()
+	if err := m.listResourcesAndPrompts(verifyCtx, eachList, tempClient, config.Name, caps, snapshot, m.installedSnapshotByID(config.ID)); err != nil && caps.Tools == nil {
+		return nil, fmt.Errorf("failed to list the server's resources and prompts during verification: %w", err)
+	}
 
 	m.logger.Info("%s Per-user headers verification succeeded for '%s': discovered %d tools", MCPLogPrefix, config.Name, len(tools))
 	return snapshot, nil
@@ -2179,6 +2187,8 @@ func (m *MCPManager) UpdateClient(id string, updatedConfig *schemas.MCPClientCon
 			Headers:                maps.Clone(updatedConfig.Headers),
 			ToolsToExecute:         slices.Clone(updatedConfig.ToolsToExecute),
 			ToolsToAutoExecute:     slices.Clone(updatedConfig.ToolsToAutoExecute),
+			PromptsToExpose:        slices.Clone(updatedConfig.PromptsToExpose),
+			ResourcesToExpose:      slices.Clone(updatedConfig.ResourcesToExpose),
 			AllowedExtraHeaders:    slices.Clone(updatedConfig.AllowedExtraHeaders),
 			IsPingAvailable:        updatedConfig.IsPingAvailable,
 			NeedsSessionStickiness: updatedConfig.NeedsSessionStickiness,
@@ -3181,7 +3191,11 @@ func (m *MCPManager) connectToMCPClient(requestCtx context.Context, config *sche
 				previous.Resources, previous.ResourceTemplates, previous.Prompts = config.DiscoveredResources, config.DiscoveredResourceTemplates, config.DiscoveredPrompts
 			}
 			m.mu.RUnlock()
-			m.listResourcesAndPrompts(toolRetrievalCtx, 0, externalClient, config.Name, externalClient.GetServerCapabilities(), snapshot, previous)
+			// Without tools, tools/list never reached the server; its resources and prompts lists did.
+			caps := externalClient.GetServerCapabilities()
+			if err := m.listResourcesAndPrompts(toolRetrievalCtx, 0, externalClient, config.Name, caps, snapshot, previous); err != nil && caps.Tools == nil {
+				listToolsErr = err
+			}
 		}
 		m.logger.Debug("%s [%s] Retrieved %d tools", MCPLogPrefix, config.Name, len(tools))
 	}

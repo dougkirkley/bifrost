@@ -417,7 +417,13 @@ func (c *ClientConnectionChecker) checkLiveConnection(conn *client.Client, clien
 	}
 
 	snapshot := &schemas.MCPServerSnapshot{Tools: newTools, ToolNameMapping: newMapping}
-	c.manager.listResourcesAndPrompts(c.markAsCheck(context.Background()), c.timeout, conn, clientName, conn.GetServerCapabilities(), snapshot, c.manager.installedSnapshotByID(c.clientID))
+	caps := conn.GetServerCapabilities()
+	listErr = c.manager.listResourcesAndPrompts(c.markAsCheck(context.Background()), c.timeout, conn, clientName, caps, snapshot, c.manager.installedSnapshotByID(c.clientID))
+	// Without tools, list_tools above never reached the server; its resources and prompts lists did.
+	if listErr != nil && caps.Tools == nil {
+		c.recordFailure(clientName, schemas.MCPConnectionFailureStageListTools, listErr, connGeneration)
+		return false
+	}
 	c.manager.writeBackSnapshot(c.clientID, connGeneration, snapshot, false)
 	c.recordSuccess(clientName, connGeneration)
 	return true

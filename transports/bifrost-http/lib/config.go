@@ -2496,6 +2496,14 @@ func pinMCPClientImmutableFields(fileClient, existing *schemas.MCPClientConfig) 
 	if fileClient.MaxProtocolVersion == "" {
 		fileClient.MaxProtocolVersion = existing.MaxProtocolVersion
 	}
+	// An omitted allow-list exposes everything, so it keeps the stored one rather than widening it;
+	// the file opens it up with ["*"].
+	if fileClient.PromptsToExpose == nil {
+		fileClient.PromptsToExpose = existing.PromptsToExpose
+	}
+	if fileClient.ResourcesToExpose == nil {
+		fileClient.ResourcesToExpose = existing.ResourcesToExpose
+	}
 
 	// A stored require_public_target records that the client was registered
 	// with no credential check; a file entry that omits it must not lift the
@@ -2767,6 +2775,8 @@ func applyMCPClientPinnedStateToRow(row *configstoreTables.TableMCPClient, clien
 	row.NeedsSessionStickiness = clientConfig.NeedsSessionStickiness
 	row.RequirePublicTarget = clientConfig.RequirePublicTarget
 	row.MaxProtocolVersion = clientConfig.MaxProtocolVersion
+	row.PromptsToExpose = clientConfig.PromptsToExpose
+	row.ResourcesToExpose = clientConfig.ResourcesToExpose
 }
 
 // mergeMCPConfig merges MCP config from file with store
@@ -3002,6 +3012,12 @@ func mcpClientConfigToTable(clientConfig *schemas.MCPClientConfig) (configstoreT
 	if err := schemas.ValidateMCPMaxProtocolVersion("max_protocol_version", clientConfig.MaxProtocolVersion); err != nil {
 		return configstoreTables.TableMCPClient{}, err
 	}
+	if err := clientConfig.PromptsToExpose.Validate(); clientConfig.PromptsToExpose != nil && err != nil {
+		return configstoreTables.TableMCPClient{}, fmt.Errorf("invalid prompts_to_expose: %w", err)
+	}
+	if err := clientConfig.ResourcesToExpose.Validate(); clientConfig.ResourcesToExpose != nil && err != nil {
+		return configstoreTables.TableMCPClient{}, fmt.Errorf("invalid resources_to_expose: %w", err)
+	}
 	if clientConfig.ToolExecutionTimeout < 0 {
 		return configstoreTables.TableMCPClient{}, fmt.Errorf(
 			"tool_execution_timeout must be >= 0, got %q",
@@ -3024,6 +3040,8 @@ func mcpClientConfigToTable(clientConfig *schemas.MCPClientConfig) (configstoreT
 		OauthConfigID:             clientConfig.OauthConfigID,
 		ToolsToExecute:            clientConfig.ToolsToExecute,
 		ToolsToAutoExecute:        clientConfig.ToolsToAutoExecute,
+		PromptsToExpose:           clientConfig.PromptsToExpose,
+		ResourcesToExpose:         clientConfig.ResourcesToExpose,
 		Headers:                   clientConfig.Headers,
 		AllowedExtraHeaders:       clientConfig.AllowedExtraHeaders,
 		IsPingAvailable:           clientConfig.IsPingAvailable,
@@ -9318,6 +9336,8 @@ func (c *Config) UpdateMCPClient(ctx context.Context, id string, updatedConfig *
 	c.MCPConfig.ClientConfigs[configIndex].Headers = updatedConfig.Headers
 	c.MCPConfig.ClientConfigs[configIndex].ToolsToExecute = updatedConfig.ToolsToExecute
 	c.MCPConfig.ClientConfigs[configIndex].ToolsToAutoExecute = updatedConfig.ToolsToAutoExecute
+	c.MCPConfig.ClientConfigs[configIndex].PromptsToExpose = updatedConfig.PromptsToExpose
+	c.MCPConfig.ClientConfigs[configIndex].ResourcesToExpose = updatedConfig.ResourcesToExpose
 	c.MCPConfig.ClientConfigs[configIndex].AllowedExtraHeaders = updatedConfig.AllowedExtraHeaders
 	c.MCPConfig.ClientConfigs[configIndex].ToolPricing = updatedConfig.ToolPricing
 	c.MCPConfig.ClientConfigs[configIndex].IsPingAvailable = updatedConfig.IsPingAvailable
