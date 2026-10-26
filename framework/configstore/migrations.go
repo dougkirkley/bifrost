@@ -577,6 +577,7 @@ var configstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"widen_oauth2_client_id_columns"}, run: migrationWidenOAuth2ClientIDColumns},
 	{IDs: []string{"add_oauth2_refresh_token_client_display_name_column"}, run: migrationAddOAuth2RefreshTokenClientDisplayNameColumn},
 	{IDs: []string{"add_mcp_max_protocol_version_columns"}, run: migrationAddMCPMaxProtocolVersionColumns},
+	{IDs: []string{"add_mcp_client_discovered_resources_prompts_columns"}, run: migrationAddMCPClientDiscoveredResourcesPromptsColumns},
 }
 
 // warpLogEmbeddingColumns are the semantic-search configuration columns added
@@ -16593,6 +16594,43 @@ func migrationAddMCPMaxProtocolVersionColumns(ctx context.Context, db *gorm.DB, 
 				return err
 			}
 			return dropColumnIfExists(tx, logger, &tables.TableMCPClient{}, "max_protocol_version")
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error while running db migration %s: %w", migrationName, err)
+	}
+	return nil
+}
+
+var mcpClientDiscoveredListColumns = []string{"discovered_resources_json", "discovered_resource_templates_json", "discovered_prompts_json"}
+
+// migrationAddMCPClientDiscoveredResourcesPromptsColumns adds the config_mcp_clients columns that
+// persist an MCP client's discovered resources, resource templates and prompts.
+func migrationAddMCPClientDiscoveredResourcesPromptsColumns(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "add_mcp_client_discovered_resources_prompts_columns"
+	logger.Info("[configstore] starting migration %s", migrationName)
+	defer logger.Info("[configstore] finished migration %s", migrationName)
+	m := migrator.New(db, migrator.DefaultOptions, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			if err := setMigrationLockTimeout(tx); err != nil {
+				return err
+			}
+			for _, column := range mcpClientDiscoveredListColumns {
+				if err := addColumnIfNotExists(tx, logger, &tables.TableMCPClient{}, column); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			for _, column := range mcpClientDiscoveredListColumns {
+				if err := dropColumnIfExists(tx.WithContext(ctx), logger, &tables.TableMCPClient{}, column); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}})
 	if err := m.Migrate(); err != nil {
