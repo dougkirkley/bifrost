@@ -13,6 +13,7 @@ import { LogsPage } from "../../features/logs/pages/logs.page";
 import { MCPLogsPage } from "../../features/mcp-logs/pages/mcp-logs.page";
 import { RoutingRulesPage } from "../../features/routing-rules/pages/routing-rules.page";
 import { MCPRegistryPage } from "../../features/mcp-registry/pages/mcp-registry.page";
+import { RelaysPage } from "../../features/relays/pages/relays.page";
 import { PluginsPage } from "../../features/plugins/pages/plugins.page";
 import { ObservabilityPage } from "../../features/observability/pages/observability.page";
 import { ConfigSettingsPage } from "../../features/config/pages/config-settings.page";
@@ -41,6 +42,7 @@ type BifrostFixtures = {
 	routingRulesPage: RoutingRulesPage;
 	mcpRegistryPage: MCPRegistryPage;
 	pluginsPage: PluginsPage;
+	relaysPage: RelaysPage;
 	observabilityPage: ObservabilityPage;
 	configSettingsPage: ConfigSettingsPage;
 	governancePage: GovernancePage;
@@ -206,6 +208,10 @@ export const test = base.extend<BifrostFixtures>({
 
 	pluginsPage: async ({ page }, use) => {
 		await use(new PluginsPage(page));
+	},
+
+	relaysPage: async ({ page }, use) => {
+		await use(new RelaysPage(page));
 	},
 
 	observabilityPage: async ({ page }, use) => {
