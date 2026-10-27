@@ -36,6 +36,8 @@ Use an absolute HTTP or HTTPS callback URL without credentials embedded in the U
 
   An explicit create operation registers the upstream configuration first, then saves the local configuration. If local storage fails, Bifrost attempts to remove the upstream registration and returns an error.
 
+  An embedded configuration uses the message request's effective tenant: the explicit request tenant, then the selected upstream interface's tenant, then the request context. Its tenant must match the message request. Updating an existing task's configuration replaces only that tenant's registration. Retries do not move a registration to a different tenant.
+
   Get and list operations first authorize the request through the upstream agent. If the upstream returns the gateway-minted notification token, Bifrost uses it to resolve the stored callback. If the token is omitted, Bifrost matches the effective tenant, task ID, and configuration ID for registrations whose tenant binding was recorded by the gateway. Older registrations without this binding still require the token; re-register them through Bifrost to enable tokenless reads and cleanup. Responses return your callback URL, omit notification tokens, and include only the authentication scheme. Callback credentials are write-only.
 </Accordion>
 

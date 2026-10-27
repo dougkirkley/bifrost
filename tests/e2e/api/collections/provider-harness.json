@@ -277037,6 +277037,503 @@
           "response": []
         }
       ]
+    },
+    {
+      "name": "A2A tenant-isolation (local fixture, #8845)",
+      "description": "Fixture-only regressions for tenant-bound credential lookup, request/config identity, and outbound embedded registration. The upstream must authorize A and B independently, return A's ingress token for B's shared config, and return the unexpected config when the requested config is read. Legitimate registrations and virtual keys must be created through Bifrost first. No paid provider calls. Run FEATURE=a2a-tenant-isolation INCLUDE_SKIP=1 without a provider filter; all fixture variables are required.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "var required = [\"a2aPushAgent\", \"a2aPushVirtualKey\", \"a2aPushOtherVirtualKey\", \"a2aPushTenant\", \"a2aPushOtherTenant\", \"a2aPushTaskId\", \"a2aPushConfigId\", \"a2aPushCallbackUrl\", \"a2aPushUpstreamAuthorization\", \"a2aPushOtherAuthorization\", \"a2aPushRequestedConfigId\", \"a2aPushUnexpectedConfigId\"];",
+              "required.forEach(function (key) { if (!pm.variables.get(key)) { throw new Error(\"Missing local A2A fixture variable: \" + key); } });"
+            ]
+          }
+        }
+      ],
+      "item": [
+        {
+          "name": "[SKIP] [NO-CONTENT] A2A-tenant-isolation: reject a token from another gateway-bound tenant - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"no callback returned for rejected request\", function () {",
+                  "  pm.expect(body.result, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.error.code, pm.response.text()).to.equal(-32006);",
+                  "  pm.expect(body.error.message, pm.response.text()).to.include(\"invalid agent response\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushOtherVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushOtherAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"reject a token from another gateway-bound tenant\",\n  \"method\": \"GetTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushOtherTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] [NO-CONTENT] A2A-tenant-isolation: reject an unexpected upstream configuration ID - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"no callback returned for rejected request\", function () {",
+                  "  pm.expect(body.result, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.error.code, pm.response.text()).to.equal(-32006);",
+                  "  pm.expect(body.error.message, pm.response.text()).to.include(\"invalid agent response\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"reject an unexpected upstream configuration ID\",\n  \"method\": \"GetTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushRequestedConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] [NO-CONTENT] A2A-tenant-isolation: delete does not remove the unexpected configuration - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "pm.test(\"invalid upstream identity aborts deletion\", function () { var body = pm.response.json(); pm.expect(body.result, pm.response.text()).to.be.undefined; pm.expect(body.error.code, pm.response.text()).to.equal(-32006); pm.expect(body.error.message).to.include(\"invalid agent response\"); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"delete does not remove the unexpected configuration\",\n  \"method\": \"DeleteTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushRequestedConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] A2A-tenant-isolation: unexpected configuration remains readable after deletion - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"same-tenant callback survives rejected operations\", function () {",
+                  "  pm.expect(body.error, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.result.url).to.equal(pm.variables.get(\"a2aPushCallbackUrl\"));",
+                  "  pm.expect(body.result.id).to.equal(pm.variables.get(\"a2aPushUnexpectedConfigId\"));",
+                  "  pm.expect(body.result).not.to.have.property(\"token\");",
+                  "  if (body.result.authentication) { pm.expect(body.result.authentication).not.to.have.property(\"credentials\"); }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"unexpected configuration remains readable after deletion\",\n  \"method\": \"GetTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushUnexpectedConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] [NO-CONTENT] A2A-tenant-isolation: reject mismatched embedded configuration tenant - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"no callback returned for rejected request\", function () {",
+                  "  pm.expect(body.result, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.error.code, pm.response.text()).to.equal(-32602);",
+                  "  pm.expect(body.error.message, pm.response.text()).to.include(\"must match the message tenant\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"reject mismatched embedded configuration tenant\",\n  \"method\": \"SendMessage\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"message\": {\n      \"messageId\": \"tenant-isolation-probe\",\n      \"role\": \"ROLE_USER\",\n      \"taskId\": \"{{a2aPushTaskId}}\",\n      \"parts\": [\n        {\n          \"text\": \"tenant isolation probe\"\n        }\n      ]\n    },\n    \"configuration\": {\n      \"taskPushNotificationConfig\": {\n        \"tenant\": \"{{a2aPushOtherTenant}}\",\n        \"id\": \"{{a2aPushConfigId}}\",\n        \"url\": \"{{a2aPushCallbackUrl}}\"\n      }\n    }\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] [NO-CONTENT] A2A-tenant-isolation: reject cross-tenant embedded forwarding upstream - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"no callback returned for rejected request\", function () {",
+                  "  pm.expect(body.result, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.error.code, pm.response.text()).to.equal(-31403);",
+                  "  pm.expect(body.error.message, pm.response.text()).to.include(\"permission denied\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushOtherVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushOtherAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"reject cross-tenant embedded forwarding upstream\",\n  \"method\": \"SendMessage\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"message\": {\n      \"messageId\": \"tenant-isolation-probe\",\n      \"role\": \"ROLE_USER\",\n      \"taskId\": \"{{a2aPushTaskId}}\",\n      \"parts\": [\n        {\n          \"text\": \"tenant isolation probe\"\n        }\n      ]\n    },\n    \"configuration\": {\n      \"taskPushNotificationConfig\": {\n        \"tenant\": \"{{a2aPushTenant}}\",\n        \"id\": \"{{a2aPushConfigId}}\",\n        \"url\": \"{{a2aPushCallbackUrl}}\"\n      }\n    }\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] A2A-tenant-isolation: same-tenant registration is unchanged after denied forwarding - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"same-tenant callback survives rejected operations\", function () {",
+                  "  pm.expect(body.error, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.result.url).to.equal(pm.variables.get(\"a2aPushCallbackUrl\"));",
+                  "  pm.expect(body.result.id).to.equal(pm.variables.get(\"a2aPushConfigId\"));",
+                  "  pm.expect(body.result).not.to.have.property(\"token\");",
+                  "  if (body.result.authentication) { pm.expect(body.result.authentication).not.to.have.property(\"credentials\"); }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"same-tenant registration is unchanged after denied forwarding\",\n  \"method\": \"GetTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] A2A-tenant-isolation: update the same-tenant registration through an embedded send - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "pm.test(\"same-tenant embedded send succeeds\", function () { var body = pm.response.json(); pm.expect(body.error, pm.response.text()).to.be.undefined; pm.expect(body.result.task.id).to.equal(pm.variables.get(\"a2aPushTaskId\")); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"reject cross-tenant embedded forwarding upstream\",\n  \"method\": \"SendMessage\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"message\": {\n      \"messageId\": \"tenant-isolation-probe\",\n      \"role\": \"ROLE_USER\",\n      \"taskId\": \"{{a2aPushTaskId}}\",\n      \"parts\": [\n        {\n          \"text\": \"tenant isolation probe\"\n        }\n      ]\n    },\n    \"configuration\": {\n      \"taskPushNotificationConfig\": {\n        \"tenant\": \"{{a2aPushTenant}}\",\n        \"id\": \"{{a2aPushConfigId}}\",\n        \"url\": \"{{a2aPushCallbackUrl}}\"\n      }\n    }\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] A2A-tenant-isolation: updated embedded callback is readable under its registration - #8845",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"same-tenant callback survives rejected operations\", function () {",
+                  "  pm.expect(body.error, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.result.url).to.equal(pm.variables.get(\"a2aPushCallbackUrl\"));",
+                  "  pm.expect(body.result.id).to.equal(pm.variables.get(\"a2aPushConfigId\"));",
+                  "  pm.expect(body.result).not.to.have.property(\"token\");",
+                  "  if (body.result.authentication) { pm.expect(body.result.authentication).not.to.have.property(\"credentials\"); }",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"same-tenant registration is unchanged after denied forwarding\",\n  \"method\": \"GetTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc"
+          },
+          "response": []
+        },
+        {
+          "name": "[SKIP] A2A-tenant-isolation: legacy callback reads report the authorized tenant - #8845",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.variables.get(\"a2aPushLegacyConfigId\")) { throw new Error(\"Missing legacy A2A fixture configuration ID\"); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP success\", function () { pm.expect(pm.response.code, pm.response.text()).to.equal(200); });",
+                  "var body = pm.response.json();",
+                  "pm.test(\"same-tenant callback survives rejected operations\", function () {",
+                  "  pm.expect(body.error, pm.response.text()).to.be.undefined;",
+                  "  pm.expect(body.result.url).to.equal(pm.variables.get(\"a2aPushCallbackUrl\"));",
+                  "  pm.expect(body.result.id).to.equal(pm.variables.get(\"a2aPushLegacyConfigId\"));",
+                  "  pm.expect(body.result).not.to.have.property(\"token\");",
+                  "  if (body.result.authentication) { pm.expect(body.result.authentication).not.to.have.property(\"credentials\"); }",
+                  "  pm.expect(body.result.tenant).to.equal(pm.variables.get(\"a2aPushTenant\"));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "A2A-Version",
+                "value": "1.0"
+              },
+              {
+                "key": "x-bf-vk",
+                "value": "{{a2aPushVirtualKey}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "{{a2aPushUpstreamAuthorization}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"same-tenant registration is unchanged after denied forwarding\",\n  \"method\": \"GetTaskPushNotificationConfig\",\n  \"params\": {\n    \"tenant\": \"{{a2aPushTenant}}\",\n    \"taskId\": \"{{a2aPushTaskId}}\",\n    \"id\": \"{{a2aPushLegacyConfigId}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/agents/a2a/{{a2aPushAgent}}/json-rpc",
+            "description": "Requires an upgraded legacy row whose tenant metadata differs from the authorized upstream namespace and whose tenant_bound marker is false. The upstream must return its original gateway token. Reads must project the authorized tenant without changing the stored legacy row."
+          },
+          "response": []
+        }
+      ]
     }
   ]
 }
