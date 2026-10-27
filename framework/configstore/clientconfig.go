@@ -668,7 +668,7 @@ type ProviderConfig struct {
 	OpenAIConfig             *schemas.OpenAIConfig             `json:"openai_config,omitempty"`               // OpenAI-specific configuration
 	PromptCache              *schemas.PromptCacheConfig        `json:"prompt_cache,omitempty"`                // Prompt-cache breakpoint injection
 	InjectedTools            []schemas.InjectedTool            `json:"injected_tools,omitempty"`              // MCP tools injected and auto-executed server side
-	Passthrough              *schemas.PassthroughPolicy        `json:"passthrough,omitempty"`                 // Routes the HTTP passthrough endpoints may forward
+	Passthrough              *schemas.PassthroughPolicy        `json:"passthrough,omitempty"`                 // Routes the HTTP relays may forward
 	ConfigHash               string                            `json:"config_hash,omitempty"`                 // Hash of config.json version, used for change detection
 	Status                   string                            `json:"status,omitempty"`                      // Model discovery status for keyless providers
 	Description              string                            `json:"description,omitempty"`                 // Model discovery error message for keyless providers
@@ -1399,6 +1399,19 @@ func GenerateVirtualKeyHash(vk tables.TableVirtualKey) (string, error) {
 		}
 		hash.Write([]byte("metadata:"))
 		hash.Write(data)
+	}
+	// Hash relay access only when the key says something, so every key that predates
+	// relays keeps its hash. Grant names are sorted so file order cannot move it.
+	if vk.AllowAllRelays {
+		hash.Write([]byte("allowAllRelays:true"))
+	}
+	if vk.RelayGrants != nil {
+		names := make([]string, 0, len(vk.RelayGrants))
+		for _, g := range vk.RelayGrants {
+			names = append(names, g.RelayName)
+		}
+		sort.Strings(names)
+		hash.Write([]byte("relayGrants:" + strings.Join(names, ",")))
 	}
 	// Hash ExpiresAt only when set, so rows created before expiry existed keep their hash
 	if vk.ExpiresAt != nil {

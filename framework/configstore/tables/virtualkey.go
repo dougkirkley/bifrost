@@ -252,6 +252,7 @@ type TableVirtualKey struct {
 	ProviderConfigs   []TableVirtualKeyProviderConfig `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"provider_configs"` // Empty means no providers allowed (deny-by-default)
 	MCPConfigs        []TableVirtualKeyMCPConfig      `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"mcp_configs"`
 	AgentGrants       []TableVirtualKeyAgentGrant     `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"agent_grants"`
+	RelayGrants       []TableVirtualKeyRelayGrant     `gorm:"foreignKey:VirtualKeyID;constraint:OnDelete:CASCADE" json:"relay_grants"`
 
 	// Foreign key relationships. TeamID, CustomerID and BusinessUnitID are mutually exclusive: a
 	// key belongs to at most one owner, which is what decides whose money it spends and whose
@@ -267,6 +268,8 @@ type TableVirtualKey struct {
 	CalendarAligned bool `gorm:"default:false" json:"calendar_aligned"`
 
 	AllowAllProviders bool `gorm:"default:false" json:"allow_all_providers"`
+
+	AllowAllRelays bool `gorm:"default:false" json:"allow_all_relays"` // every relay, without grant rows
 
 	// DisableContentLogging is the key's own say on whether request and response content is
 	// persisted for its traffic. Tri-state on purpose: nil inherits client.disable_content_logging,

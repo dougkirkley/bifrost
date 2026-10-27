@@ -3822,7 +3822,8 @@ func preloadVirtualKeyBaseRelations(db *gorm.DB) *gorm.DB {
 		}).
 		Preload("MCPConfigs").
 		Preload("MCPConfigs.MCPClient").
-		Preload("AgentGrants")
+		Preload("AgentGrants").
+		Preload("RelayGrants")
 }
 
 // preloadVirtualKeyDetailRelations preloads the detail relationships for a virtual key.
