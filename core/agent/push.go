@@ -327,9 +327,9 @@ func (m *Manager) createPushConfig(ctx context.Context, client sdkClient, agentN
 	stored := storedPushConfig(agentName, string(config.TaskID), configID, hash, config)
 	stored.Tenant = upstream.Tenant
 	phase := startPhaseSpan(schemas.NewBifrostContext(ctx, schemas.NoDeadline), "a2a.push.db.save")
-	saveErr := m.pushStore.SaveAgentPushConfig(ctx, stored)
+	err = m.pushStore.SaveAgentPushConfig(ctx, stored)
 	endPhaseSpan(phase)
-	if err := saveErr; err != nil {
+	if err != nil {
 		rollbackStart := time.Now()
 		_ = client.DeleteTaskPushConfig(ctx, &a2a.DeleteTaskPushConfigRequest{Tenant: upstream.Tenant, TaskID: config.TaskID, ID: configID})
 		schemas.AddUpstreamLatency(ctx, time.Since(rollbackStart))
@@ -345,29 +345,6 @@ func isPendingAgentPushConfig(taskID string) bool {
 }
 
 const pendingAgentPushConfigTaskIDPrefix = "__bifrost_pending__:"
-
-// resolvePushTenant mirrors the SDK's explicit/interface/context precedence.
-// Embedded registrations are persisted before SendMessage, so pin the resolved
-// namespace before the upstream can send its first notification.
-func (h *proxyRequestHandler) resolvePushTenant(ctx context.Context, explicit string) (string, error) {
-	if explicit != "" {
-		return explicit, nil
-	}
-	if h.runtime == nil {
-		tenant, _ := a2a.TenantFrom(ctx)
-		return tenant, nil
-	}
-	lease, err := h.runtime.acquire(ctx, h.manager)
-	if err != nil {
-		return "", err
-	}
-	defer lease.release()
-	if lease.candidate.tenant != "" {
-		return lease.candidate.tenant, nil
-	}
-	tenant, _ := a2a.TenantFrom(ctx)
-	return tenant, nil
-}
 
 // rewriteEmbeddedPushConfig intercepts a push configuration embedded in a
 // message send (SendMessageConfig.PushConfig). The same two-hop rule as
@@ -400,9 +377,12 @@ func (h *proxyRequestHandler) rewriteEmbeddedPushConfig(ctx context.Context, req
 	if err := validatePushCallbackAuth(original.Auth); err != nil {
 		return nil, err
 	}
-	tenant, err := h.resolvePushTenant(ctx, req.Tenant)
-	if err != nil {
-		return nil, err
+	// Called inside the forwarding lease. upstreamContext supplies that
+	// client's interface tenant, falling back to the inbound context; an
+	// explicit request tenant takes precedence, just as in the SDK.
+	tenant := req.Tenant
+	if tenant == "" {
+		tenant, _ = a2a.TenantFrom(ctx)
 	}
 	if original.Tenant != "" && original.Tenant != tenant {
 		return nil, fmt.Errorf("%w: embedded push configuration tenant must match the message tenant", a2a.ErrInvalidParams)
@@ -425,9 +405,9 @@ func (h *proxyRequestHandler) rewriteEmbeddedPushConfig(ctx context.Context, req
 	pendingTaskID := pendingAgentPushConfigTaskIDPrefix + uuid.NewString()
 	stored := storedPushConfig(agentName, pendingTaskID, configID, hash, &original)
 	phase := startPhaseSpan(schemas.NewBifrostContext(ctx, schemas.NoDeadline), "a2a.push.db.save")
-	saveErr := m.pushStore.SaveAgentPushConfig(ctx, stored)
+	err = m.pushStore.SaveAgentPushConfig(ctx, stored)
 	endPhaseSpan(phase)
-	if err := saveErr; err != nil {
+	if err != nil {
 		return nil, fmt.Errorf("persist push configuration: %w", err)
 	}
 	req.Config.PushConfig = &a2a.PushConfig{
@@ -487,12 +467,15 @@ func eventTaskID(event a2a.Event) a2a.TaskID {
 	return ""
 }
 
-// localPushConfig projects a configuration authorized by the upstream. Tokens
+// localPushConfig resolves the callback for a configuration authorized upstream. Tokens
 // are optional on reads, so use the effective request tenant when omitted.
 // Legacy tenant metadata is not authoritative and still requires the token.
-func (m *Manager) localPushConfig(ctx context.Context, agentName, tenant, taskID string, upstream *a2a.PushConfig) (*schemas.AgentPushConfig, error) {
-	if upstream == nil || string(upstream.TaskID) != taskID {
+func (m *Manager) localPushConfig(ctx context.Context, agentName, tenant, taskID, configID string, upstream *a2a.PushConfig) (*schemas.AgentPushConfig, error) {
+	if upstream == nil {
 		return nil, push.ErrPushConfigNotFound
+	}
+	if string(upstream.TaskID) != taskID || (configID != "" && upstream.ID != configID) {
+		return nil, a2a.ErrInvalidAgentResponse
 	}
 	phase := startPhaseSpan(gateContext(ctx), "a2a.push.db.local")
 	var stored *schemas.AgentPushConfig
@@ -509,15 +492,18 @@ func (m *Manager) localPushConfig(ctx context.Context, agentName, tenant, taskID
 	if err != nil {
 		return nil, err
 	}
-	if stored == nil || stored.TaskID != taskID || stored.ConfigID != upstream.ID {
+	if stored == nil || stored.TaskID != taskID {
 		return nil, push.ErrPushConfigNotFound
+	}
+	if stored.ConfigID != upstream.ID || (stored.TenantBound && stored.Tenant != tenant) {
+		return nil, a2a.ErrInvalidAgentResponse
 	}
 	return stored, nil
 }
 
-// GetTaskPushConfig answers from the gateway's own store: the upstream's copy
-// describes Bifrost's ingress and its minted credential, never the client's
-// callback, so forwarding the read would leak the wrong hop.
+// GetTaskPushConfig authorizes the read upstream, then returns the stored
+// callback. The upstream's copy describes Bifrost's ingress and minted credential,
+// not the client's callback, and must never be returned to the client.
 func (h *proxyRequestHandler) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.PushConfig, error) {
 	m := h.manager
 	if !m.pushEnabled() {
@@ -528,22 +514,26 @@ func (h *proxyRequestHandler) GetTaskPushConfig(ctx context.Context, req *a2a.Ge
 	}
 	envelope := h.pushEnvelope(schemas.A2ARequestTypeGetTaskPushConfig, req.TaskID, req.ID, req)
 	return forwardUpstream(ctx, h, envelope, func(ctx context.Context, client sdkClient) (*a2a.PushConfig, error) {
+		callStart := time.Now()
 		upstream, err := client.GetTaskPushConfig(ctx, req)
+		schemas.AddUpstreamLatency(ctx, time.Since(callStart))
 		if err != nil {
 			return nil, err
 		}
-		stored, err := m.localPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), upstream)
+		stored, err := m.localPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), req.ID, upstream)
 		if err != nil {
 			return nil, err
 		}
-		return redactedPushConfig(stored), nil
+		callback := redactedPushConfig(stored)
+		callback.Tenant = req.Tenant // Legacy stored tenant metadata may be unrelated to this namespace.
+		return callback, nil
 	}, func(result *a2a.PushConfig) *schemas.BifrostA2AResponse {
 		return describePushResult(result.ID)
 	})
 }
 
-// ListTaskPushConfigs lists the gateway's stored callbacks for one task, for
-// the same reason GetTaskPushConfig is local.
+// ListTaskPushConfigs authorizes the task upstream and resolves each returned
+// registration to its stored callback, just like GetTaskPushConfig.
 func (h *proxyRequestHandler) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) (*a2a.ListTaskPushConfigResponse, error) {
 	m := h.manager
 	if !m.pushEnabled() {
@@ -556,20 +546,24 @@ func (h *proxyRequestHandler) ListTaskPushConfigs(ctx context.Context, req *a2a.
 	envelope.BifrostA2ATaskRequest = &schemas.BifrostA2ATaskRequest{TaskID: string(req.TaskID)}
 	setA2ARequestBody(envelope, req)
 	return forwardUpstream(ctx, h, envelope, func(ctx context.Context, client sdkClient) (*a2a.ListTaskPushConfigResponse, error) {
+		callStart := time.Now()
 		upstream, err := client.ListTaskPushConfigs(ctx, req)
+		schemas.AddUpstreamLatency(ctx, time.Since(callStart))
 		if err != nil {
 			return nil, err
 		}
 		configs := make([]*a2a.PushConfig, 0, len(upstream))
 		for _, config := range upstream {
-			stored, err := m.localPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), config)
+			stored, err := m.localPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), "", config)
 			if errors.Is(err, push.ErrPushConfigNotFound) {
 				continue // Configurations registered outside Bifrost have no local callback.
 			}
 			if err != nil {
 				return nil, err
 			}
-			configs = append(configs, redactedPushConfig(stored))
+			callback := redactedPushConfig(stored)
+			callback.Tenant = req.Tenant
+			configs = append(configs, callback)
 		}
 		return &a2a.ListTaskPushConfigResponse{Configs: configs}, nil
 	}, func(*a2a.ListTaskPushConfigResponse) *schemas.BifrostA2AResponse {
@@ -591,27 +585,41 @@ func (h *proxyRequestHandler) DeleteTaskPushConfig(ctx context.Context, req *a2a
 	envelope := h.pushEnvelope(schemas.A2ARequestTypeDeleteTaskPushConfig, req.TaskID, req.ID, req)
 	_, err := forwardUpstream(ctx, h, envelope, func(ctx context.Context, client sdkClient) (struct{}, error) {
 		callStart := time.Now()
-		defer func() { schemas.AddUpstreamLatency(ctx, time.Since(callStart)) }()
 		read := &a2a.GetTaskPushConfigRequest{Tenant: req.Tenant, TaskID: req.TaskID, ID: req.ID}
 		config, err := client.GetTaskPushConfig(ctx, read)
+		schemas.AddUpstreamLatency(ctx, time.Since(callStart))
 		if err != nil && !errors.Is(err, push.ErrPushConfigNotFound) && !errors.Is(err, a2a.ErrTaskNotFound) {
 			return struct{}{}, err
 		}
 		req.Tenant = read.Tenant
-		callErr := client.DeleteTaskPushConfig(ctx, req)
-		if err := callErr; err != nil {
-			return struct{}{}, err
-		}
-		phase := startPhaseSpan(schemas.NewBifrostContext(ctx, schemas.NoDeadline), "a2a.push.db.delete")
-		if config != nil && config.Token != "" {
-			_, err = m.pushStore.DeleteAgentPushConfigByIngressTokenHash(ctx, h.config.name, hashPushIngressToken(config.Token))
+		// Snapshot the registration before deleting upstream. Tokenless reads
+		// and already-missing upstream configs must fence replacements too.
+		var stored *schemas.AgentPushConfig
+		if err == nil {
+			stored, err = m.localPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), req.ID, config)
+			if errors.Is(err, push.ErrPushConfigNotFound) {
+				err = nil // An upstream-only registration has no local callback.
+			}
 		} else {
-			var stored *schemas.AgentPushConfig
 			stored, err = m.pushStore.GetAgentPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), req.ID)
-			if err == nil && stored != nil && stored.TenantBound {
-				_, err = m.pushStore.DeleteAgentPushConfig(ctx, h.config.name, req.Tenant, string(req.TaskID), req.ID)
+			if stored != nil && !stored.TenantBound {
+				stored = nil // Legacy metadata cannot authorize tokenless cleanup.
 			}
 		}
+		if err != nil {
+			return struct{}{}, err
+		}
+		callStart = time.Now()
+		err = client.DeleteTaskPushConfig(ctx, req)
+		schemas.AddUpstreamLatency(ctx, time.Since(callStart))
+		if err != nil {
+			return struct{}{}, err
+		}
+		if stored == nil {
+			return struct{}{}, nil
+		}
+		phase := startPhaseSpan(gateContext(ctx), "a2a.push.db.delete")
+		_, err = m.pushStore.DeleteAgentPushConfigByIngressTokenHash(ctx, h.config.name, stored.IngressTokenHash)
 		endPhaseSpan(phase)
 		if err != nil {
 			return struct{}{}, err

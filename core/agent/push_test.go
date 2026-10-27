@@ -3,7 +3,6 @@ package agent
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -588,12 +587,14 @@ func (s *memoryPushStore) rescheduleNow(id string) {
 // upstream.
 type pushUpstreamClient struct {
 	fakeSDKClient
-	mu        sync.Mutex
-	created   []*a2a.PushConfig
-	deleted   []*a2a.DeleteTaskPushConfigRequest
-	readErr   error
-	omitToken bool
-	deleteErr error
+	mu         sync.Mutex
+	created    []*a2a.PushConfig
+	deleted    []*a2a.DeleteTaskPushConfigRequest
+	readErr    error
+	readConfig *a2a.PushConfig
+	omitToken  bool
+	deleteErr  error
+	onDelete   func()
 }
 
 func (c *pushUpstreamClient) GetTaskPushConfig(_ context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.PushConfig, error) {
@@ -601,6 +602,10 @@ func (c *pushUpstreamClient) GetTaskPushConfig(_ context.Context, req *a2a.GetTa
 	defer c.mu.Unlock()
 	if c.readErr != nil {
 		return nil, c.readErr
+	}
+	if c.readConfig != nil {
+		config := *c.readConfig
+		return &config, nil
 	}
 	for _, cfg := range c.created {
 		if cfg.Tenant == req.Tenant && cfg.TaskID == req.TaskID && cfg.ID == req.ID {
@@ -666,12 +671,52 @@ func TestPushDeliveryIDsAreScopedToTenant(t *testing.T) {
 	require.Len(t, store.deliveries, 2, "identical events in different tenants must not deduplicate together")
 }
 
+func TestQueuedPushDeliveryKeepsItsRegistration(t *testing.T) {
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		t.Run(tenant, func(t *testing.T) {
+			store := newMemoryPushStore()
+			calls := 0
+			m := &Manager{ctx: context.Background(), externalURL: "https://gateway.example", pushStore: store, pushRelayID: "runner",
+				pushDeliveryClient: &http.Client{Transport: pushRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					calls++
+					require.Equal(t, "https://tenant-a.example/callback", req.URL.String())
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+				})},
+			}
+			m.runtimes.store("fixture", &runtimeAgent{})
+			config := &schemas.AgentPushConfig{AgentName: "fixture", Tenant: "tenant-a", TenantBound: true, TaskID: "task", ConfigID: "config", URL: "https://tenant-a.example/callback", IngressTokenHash: hashPushIngressToken("original")}
+			require.NoError(t, store.SaveAgentPushConfig(t.Context(), config))
+			status, err := m.AcceptPushCallback(t.Context(), "fixture", "original", pushEventPayload(t, "task"))
+			require.NoError(t, err)
+			require.Equal(t, http.StatusAccepted, status)
+			// Register after acceptance, before the outbox worker resolves a callback.
+			config.Tenant, config.URL, config.IngressTokenHash = tenant, "https://replacement.example/callback", hashPushIngressToken("replacement")
+			require.NoError(t, store.SaveAgentPushConfig(t.Context(), config))
+			due, err := store.ListDueAgentPushDeliveries(t.Context(), time.Now().Add(time.Second), 10)
+			require.NoError(t, err)
+			require.Len(t, due, 1)
+			lease := time.Now().Add(pushDeliveryLease)
+			delivery, err := store.ClaimAgentPushDelivery(t.Context(), due[0].ID, m.pushRelayID, lease)
+			require.NoError(t, err)
+			require.NotNil(t, delivery)
+			newPushRelay(m).deliver(delivery, lease)
+			if tenant == "tenant-a" {
+				require.Zero(t, calls, "an old notification must not follow a replacement callback")
+				require.Equal(t, schemas.AgentPushDeliveryStatusDead, store.deliveryStatus(delivery.ID))
+			} else {
+				require.Equal(t, 1, calls, "another tenant's registration must not affect this delivery")
+				require.Equal(t, schemas.AgentPushDeliveryStatusDelivered, store.deliveryStatus(delivery.ID))
+			}
+		})
+	}
+}
+
 func BenchmarkPushDeliveryIdentity(b *testing.B) {
 	payload := string(pushEventPayloadForBenchmark())
+	config := &schemas.AgentPushConfig{Tenant: "tenant", TaskID: "task", ConfigID: "config", IngressTokenHash: hashPushIngressToken("token")}
 	b.ReportAllocs()
 	for b.Loop() {
-		sum := sha256.Sum256([]byte("fixture" + "\x00" + "config" + "\x00" + payload))
-		if sum == ([32]byte{}) {
+		if pushDeliveryID("fixture", config, payload) == "" {
 			b.Fatal("empty digest")
 		}
 	}
@@ -701,7 +746,8 @@ func BenchmarkPushConfigReadWithoutUpstreamToken(b *testing.B) {
 	benchmarkPushConfigRead(b, true)
 }
 
-func benchmarkPushConfigRead(b *testing.B, omitToken bool) {
+func benchmarkPushGateway(b *testing.B) (*proxyRequestHandler, *pushUpstreamClient) {
+	b.Helper()
 	store := newMemoryPushStore()
 	m, err := NewManager(context.Background(), store, nil, "http://gateway", nil)
 	if err != nil {
@@ -709,12 +755,20 @@ func benchmarkPushConfigRead(b *testing.B, omitToken bool) {
 	}
 	b.Cleanup(m.Close)
 	runtime := m.buildRuntime(schemas.AgentRegistration{Name: "fixture", Enabled: true})
-	client := &pushUpstreamClient{omitToken: omitToken}
+	client := &pushUpstreamClient{fakeSDKClient: fakeSDKClient{send: func(context.Context, *a2a.SendMessageRequest) (a2a.SendMessageResult, error) {
+		return &a2a.Task{ID: "task"}, nil
+	}}}
 	if err := runtime.replaceGeneration(newClientGeneration(&a2a.AgentCard{}, client, string(a2a.TransportProtocolJSONRPC))); err != nil {
 		b.Fatal(err)
 	}
 	m.runtimes.store("fixture", runtime)
 	h := &proxyRequestHandler{runtime: runtime, manager: m, config: runtime.config}
+	return h, client
+}
+
+func benchmarkPushConfigRead(b *testing.B, omitToken bool) {
+	h, client := benchmarkPushGateway(b)
+	client.omitToken = omitToken
 	if _, err := h.CreateTaskPushConfig(context.Background(), &a2a.PushConfig{TaskID: "task", ID: "config", URL: "http://callback.example"}); err != nil {
 		b.Fatal(err)
 	}
@@ -723,6 +777,37 @@ func benchmarkPushConfigRead(b *testing.B, omitToken bool) {
 	b.ResetTimer()
 	for b.Loop() {
 		if _, err := h.GetTaskPushConfig(context.Background(), req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSendMessageWithoutPush(b *testing.B) {
+	h, _ := benchmarkPushGateway(b)
+	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi"))}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := h.SendMessage(context.Background(), req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPushConfigCreateAndDelete(b *testing.B) {
+	h, client := benchmarkPushGateway(b)
+	config := &a2a.PushConfig{Tenant: "tenant", TaskID: "task", ID: "config", URL: "https://callback.example"}
+	req := &a2a.DeleteTaskPushConfigRequest{Tenant: "tenant", TaskID: "task", ID: "config"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		// Bound the recording fixture and read only this iteration's registration.
+		client.created = client.created[:0]
+		client.deleted = client.deleted[:0]
+		if _, err := h.CreateTaskPushConfig(context.Background(), config); err != nil {
+			b.Fatal(err)
+		}
+		if err := h.DeleteTaskPushConfig(context.Background(), req); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -744,8 +829,11 @@ func TestEmbeddedPushTenantResolution(t *testing.T) {
 			m, handler, store, client := pushGateway(t)
 			require.NoError(t, handler.runtime.replaceGeneration(newCandidateGeneration(&a2a.AgentCard{}, []upstreamCandidate{{client: client, tenant: tc.iface, transport: string(a2a.TransportProtocolJSONRPC)}})))
 			ctx := a2a.AttachTenant(context.Background(), tc.contextTenant)
-			req := &a2a.SendMessageRequest{Tenant: tc.explicit, Config: &a2a.SendMessageConfig{PushConfig: &a2a.PushConfig{Tenant: tc.child, ID: "config", URL: "http://callback.example"}}}
-			finish, err := handler.rewriteEmbeddedPushConfig(ctx, req)
+			client.send = func(context.Context, *a2a.SendMessageRequest) (a2a.SendMessageResult, error) {
+				return &a2a.Task{ID: "task"}, nil
+			}
+			req := &a2a.SendMessageRequest{Tenant: tc.explicit, Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")), Config: &a2a.SendMessageConfig{PushConfig: &a2a.PushConfig{Tenant: tc.child, ID: "config", URL: "http://callback.example"}}}
+			_, err := handler.SendMessage(ctx, req)
 			if tc.invalid {
 				require.ErrorIs(t, err, a2a.ErrInvalidParams)
 				_, count, err := m.ListStoredPushConfigs(ctx, schemas.AgentPushConfigQuery{})
@@ -754,7 +842,6 @@ func TestEmbeddedPushTenantResolution(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			finish(ctx, "task")
 			stored, err := store.GetAgentPushConfig(ctx, "fixture", tc.want, "task", "config")
 			require.NoError(t, err)
 			require.NotNil(t, stored)
@@ -858,13 +945,38 @@ func TestPushReadDoesNotExposeUnboundCallback(t *testing.T) {
 	m, _, store, _ := pushGateway(t)
 	require.NoError(t, store.SaveAgentPushConfig(context.Background(), &schemas.AgentPushConfig{AgentName: "fixture", Tenant: "tenant-a", TaskID: "task", ConfigID: "config", URL: "http://callback.example", IngressTokenHash: hashPushIngressToken("gateway-token")}))
 	for _, token := range []string{"", "another-token"} {
-		config, err := m.localPushConfig(context.Background(), "fixture", "tenant-a", "task", &a2a.PushConfig{TaskID: "task", ID: "config", Token: token})
+		config, err := m.localPushConfig(context.Background(), "fixture", "tenant-a", "task", "config", &a2a.PushConfig{TaskID: "task", ID: "config", Token: token})
 		require.ErrorIs(t, err, push.ErrPushConfigNotFound)
 		require.Nil(t, config)
 	}
-	config, err := m.localPushConfig(context.Background(), "fixture", "tenant-a", "task", &a2a.PushConfig{TaskID: "task", ID: "config", Token: "gateway-token"})
+	config, err := m.localPushConfig(context.Background(), "fixture", "tenant-a", "task", "config", &a2a.PushConfig{TaskID: "task", ID: "config", Token: "gateway-token"})
 	require.NoError(t, err)
 	require.NotNil(t, config)
+}
+
+func TestLegacyPushReadReportsAuthorizedTenant(t *testing.T) {
+	_, handler, store, upstream := pushGateway(t)
+	_, err := handler.CreateTaskPushConfig(t.Context(), &a2a.PushConfig{Tenant: "tenant-b", TaskID: "task", ID: "config", URL: "https://callback.example"})
+	require.NoError(t, err)
+	legacy, err := store.GetAgentPushConfig(t.Context(), "fixture", "tenant-b", "task", "config")
+	require.NoError(t, err)
+	_, err = store.DeleteAgentPushConfig(t.Context(), "fixture", "tenant-b", "task", "config")
+	require.NoError(t, err)
+	legacy.Tenant, legacy.TenantBound = "legacy-child-tenant", false
+	require.NoError(t, store.SaveAgentPushConfig(t.Context(), legacy))
+	got, err := handler.GetTaskPushConfig(t.Context(), &a2a.GetTaskPushConfigRequest{Tenant: "tenant-b", TaskID: "task", ID: "config"})
+	require.NoError(t, err)
+	require.Equal(t, "tenant-b", got.Tenant, "reads must not return ambiguous legacy tenant metadata")
+	listed, err := handler.ListTaskPushConfigs(t.Context(), &a2a.ListTaskPushConfigRequest{Tenant: "tenant-b", TaskID: "task"})
+	require.NoError(t, err)
+	require.Len(t, listed.Configs, 1)
+	require.Equal(t, got, listed.Configs[0])
+	stored, err := store.GetAgentPushConfig(t.Context(), "fixture", legacy.Tenant, "task", "config")
+	require.NoError(t, err)
+	require.False(t, stored.TenantBound, "a read must not silently rebind a legacy registration")
+	upstream.omitToken = true
+	_, err = handler.GetTaskPushConfig(t.Context(), &a2a.GetTaskPushConfigRequest{Tenant: "tenant-b", TaskID: "task", ID: "config"})
+	require.ErrorIs(t, err, push.ErrPushConfigNotFound)
 }
 
 func (c *pushUpstreamClient) CreateTaskPushConfig(_ context.Context, config *a2a.PushConfig) (*a2a.PushConfig, error) {
@@ -879,7 +991,129 @@ func (c *pushUpstreamClient) DeleteTaskPushConfig(_ context.Context, req *a2a.De
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleted = append(c.deleted, req)
+	if c.onDelete != nil {
+		c.onDelete()
+	}
 	return c.deleteErr
+}
+
+func TestPushConfigRejectsTokenFromAnotherTenant(t *testing.T) {
+	_, handler, store, upstream := pushGateway(t)
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		_, err := handler.CreateTaskPushConfig(t.Context(), &a2a.PushConfig{Tenant: tenant, TaskID: "task", ID: "config", URL: "https://" + tenant + ".example/callback"})
+		require.NoError(t, err)
+	}
+	// Even an authorized upstream response cannot move a gateway-bound
+	// registration into another namespace by returning its token.
+	upstream.created[1].Token = upstream.created[0].Token
+	got, err := handler.GetTaskPushConfig(t.Context(), &a2a.GetTaskPushConfigRequest{Tenant: "tenant-b", TaskID: "task", ID: "config"})
+	require.ErrorIs(t, err, a2a.ErrInvalidAgentResponse)
+	require.Nil(t, got)
+	listed, err := handler.ListTaskPushConfigs(t.Context(), &a2a.ListTaskPushConfigRequest{Tenant: "tenant-b", TaskID: "task"})
+	require.ErrorIs(t, err, a2a.ErrInvalidAgentResponse)
+	require.Nil(t, listed)
+	require.ErrorIs(t, handler.DeleteTaskPushConfig(t.Context(), &a2a.DeleteTaskPushConfigRequest{Tenant: "tenant-b", TaskID: "task", ID: "config"}), a2a.ErrInvalidAgentResponse)
+	require.Empty(t, upstream.deleted)
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		stored, err := store.GetAgentPushConfig(t.Context(), "fixture", tenant, "task", "config")
+		require.NoError(t, err)
+		require.NotNil(t, stored, "an unmatched upstream registration must not delete either local callback")
+	}
+}
+
+func TestPushConfigRejectsUnexpectedConfigID(t *testing.T) {
+	_, handler, store, upstream := pushGateway(t)
+	for _, id := range []string{"requested", "other"} {
+		_, err := handler.CreateTaskPushConfig(t.Context(), &a2a.PushConfig{Tenant: "tenant", TaskID: "task", ID: id, URL: "https://callback.example/" + id})
+		require.NoError(t, err)
+	}
+	upstream.readConfig = upstream.created[1]
+	got, err := handler.GetTaskPushConfig(t.Context(), &a2a.GetTaskPushConfigRequest{Tenant: "tenant", TaskID: "task", ID: "requested"})
+	require.ErrorIs(t, err, a2a.ErrInvalidAgentResponse)
+	require.Nil(t, got)
+	require.ErrorIs(t, handler.DeleteTaskPushConfig(t.Context(), &a2a.DeleteTaskPushConfigRequest{Tenant: "tenant", TaskID: "task", ID: "requested"}), a2a.ErrInvalidAgentResponse)
+	require.Empty(t, upstream.deleted)
+	other, err := store.GetAgentPushConfig(t.Context(), "fixture", "tenant", "task", "other")
+	require.NoError(t, err)
+	require.NotNil(t, other, "deleting one config must not remove the config returned under an unexpected ID")
+}
+
+func TestPushConfigDeleteFencesConcurrentReplacement(t *testing.T) {
+	for _, mode := range []string{"token", "tokenless", "not-found"} {
+		t.Run(mode, func(t *testing.T) {
+			_, handler, store, upstream := pushGateway(t)
+			_, err := handler.CreateTaskPushConfig(t.Context(), &a2a.PushConfig{Tenant: "tenant", TaskID: "task", ID: "config", URL: "https://callback.example"})
+			require.NoError(t, err)
+			upstream.omitToken = mode == "tokenless"
+			if mode == "not-found" {
+				upstream.readErr = push.ErrPushConfigNotFound
+			}
+			upstream.onDelete = func() {
+				config, err := store.GetAgentPushConfig(t.Context(), "fixture", "tenant", "task", "config")
+				require.NoError(t, err)
+				config.IngressTokenHash = hashPushIngressToken("replacement")
+				config.URL = "https://replacement.example"
+				require.NoError(t, store.SaveAgentPushConfig(t.Context(), config))
+			}
+			require.NoError(t, handler.DeleteTaskPushConfig(t.Context(), &a2a.DeleteTaskPushConfigRequest{Tenant: "tenant", TaskID: "task", ID: "config"}))
+			config, err := store.GetAgentPushConfig(t.Context(), "fixture", "tenant", "task", "config")
+			require.NoError(t, err)
+			require.NotNil(t, config, "cleanup must delete only the registration read before upstream deletion")
+			require.Equal(t, hashPushIngressToken("replacement"), config.IngressTokenHash)
+		})
+	}
+}
+
+type pushRefreshPipeline struct {
+	*fakePipeline
+	refresh func()
+}
+
+func (p *pushRefreshPipeline) RunA2APreHooks(ctx *schemas.BifrostContext, req *schemas.BifrostA2ARequest, entered func(int)) (*schemas.BifrostA2ARequest, *schemas.A2APluginShortCircuit, int) {
+	p.refresh()
+	return p.fakePipeline.RunA2APreHooks(ctx, req, entered)
+}
+
+func TestEmbeddedPushUsesLeasedTenant(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			m, handler, store, upstream := pushGateway(t)
+			// Simulate a refresh between request construction and the plugin gate.
+			pipeline := &pushRefreshPipeline{fakePipeline: &fakePipeline{}, refresh: func() {
+				generation := newCandidateGeneration(&a2a.AgentCard{}, []upstreamCandidate{{client: upstream, tenant: "interface", transport: string(a2a.TransportProtocolJSONRPC)}})
+				require.NoError(t, handler.runtime.replaceGeneration(generation))
+			}}
+			m.SetPluginPipeline(func() PluginPipeline { return pipeline }, func(PluginPipeline) {})
+			upstream.send = func(ctx context.Context, req *a2a.SendMessageRequest) (a2a.SendMessageResult, error) {
+				tenant := req.Tenant
+				if tenant == "" {
+					tenant = "interface" // SDK-selected interface tenant.
+				}
+				stored, err := store.GetAgentPushConfigByIngressTokenHash(ctx, "fixture", hashPushIngressToken(req.Config.PushConfig.Token))
+				require.NoError(t, err)
+				require.Equal(t, tenant, stored.Tenant, "persist before sending, under the namespace of the client actually leased")
+				return &a2a.Task{ID: "task"}, nil
+			}
+			upstream.stream = func(ctx context.Context, req *a2a.SendMessageRequest) iter.Seq2[a2a.Event, error] {
+				return func(yield func(a2a.Event, error) bool) {
+					result, err := upstream.send(ctx, req)
+					yield(result, err)
+				}
+			}
+			req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")), Config: &a2a.SendMessageConfig{PushConfig: &a2a.PushConfig{ID: "config", URL: "https://callback.example"}}}
+			if streaming {
+				for _, err := range handler.SendStreamingMessage(t.Context(), req) {
+					require.NoError(t, err)
+				}
+			} else {
+				_, err := handler.SendMessage(t.Context(), req)
+				require.NoError(t, err)
+			}
+			stored, err := store.GetAgentPushConfig(t.Context(), "fixture", "interface", "task", "config")
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+		})
+	}
 }
 
 func TestPushConfigReadsWithoutUpstreamToken(t *testing.T) {
@@ -1182,7 +1416,7 @@ func TestStreamingEmbeddedPushConfigIsLazyAndCleansUpBeforeUpstreamCall(t *testi
 
 	configs, total, err = store.ListAgentPushConfigsPaginated(context.Background(), schemas.AgentPushConfigQuery{})
 	require.NoError(t, err)
-	require.Empty(t, configs, "a pre-hook denial must clean up the pending push config")
+	require.Empty(t, configs, "a pre-hook denial must not persist an embedded push config")
 	require.Zero(t, total)
 }
 
@@ -1421,6 +1655,29 @@ func TestSendMessageRetryKeepsEmbeddedPushConfigUntilFinalOutcome(t *testing.T) 
 	require.Len(t, stored, 1)
 	require.Equal(t, attempts[0].ID, stored[0].ConfigID)
 	require.Equal(t, hashPushIngressToken(attempts[0].Token), stored[0].IngressTokenHash)
+}
+
+func TestEmbeddedPushRetryCannotChangeDefaultTenant(t *testing.T) {
+	_, handler, store, _ := pushGateway(t)
+	first := &fakeSDKClient{send: func(context.Context, *a2a.SendMessageRequest) (a2a.SendMessageResult, error) {
+		return nil, dialFailure()
+	}}
+	second := &fakeSDKClient{send: func(context.Context, *a2a.SendMessageRequest) (a2a.SendMessageResult, error) {
+		t.Error("a retry must not forward a default-tenant registration to another namespace")
+		return &a2a.Task{ID: "task"}, nil
+	}}
+	require.NoError(t, handler.runtime.replaceGeneration(newCandidateGeneration(&a2a.AgentCard{}, []upstreamCandidate{
+		{client: first, transport: string(a2a.TransportProtocolJSONRPC)},
+		{client: second, tenant: "other-tenant", transport: string(a2a.TransportProtocolJSONRPC)},
+	})))
+	_, err := handler.SendMessage(t.Context(), &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("hi")),
+		Config:  &a2a.SendMessageConfig{PushConfig: &a2a.PushConfig{URL: "https://callback.example"}},
+	})
+	require.ErrorIs(t, err, a2a.ErrInvalidParams)
+	configs, _, err := store.ListAgentPushConfigsPaginated(t.Context(), schemas.AgentPushConfigQuery{})
+	require.NoError(t, err)
+	require.Empty(t, configs, "an unsuccessful send must discard its pending registration")
 }
 
 func TestDeleteTaskPushConfigRemovesBothHops(t *testing.T) {
