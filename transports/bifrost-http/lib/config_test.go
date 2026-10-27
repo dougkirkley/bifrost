@@ -25878,14 +25878,27 @@ func TestRotateMCPTokenExchangeConfigFromFile_IDJAGFields(t *testing.T) {
 		existing, file *schemas.MCPTokenExchangeConfig
 		reauth         bool
 	}{
-		"unchanged direct block":       {existing: direct(), file: direct()},
-		"unchanged id_jag block":       {existing: idjag(), file: idjag()},
-		"direct switched to id_jag":    {existing: direct(), file: idjag(), reauth: true},
-		"resource changed":             {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig { c := idjag(); c.Resource = "https://x.example.com"; return c }(), reauth: true},
+		"unchanged direct block":        {existing: direct(), file: direct()},
+		"unchanged id_jag block":        {existing: idjag(), file: idjag()},
+		"direct switched to id_jag":     {existing: direct(), file: idjag(), reauth: true},
+		"resource changed":              {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig { c := idjag(); c.Resource = "https://x.example.com"; return c }(), reauth: true},
 		"resource token endpoint moved": {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig { c := idjag(); c.ResourceTokenEndpoint = &moved; return c }(), reauth: true},
-		"resource client ID changed":    {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig { c := idjag(); c.ResourceClientID = schemas.NewSecretVar("other"); return c }(), reauth: true},
-		"resource secret rotated":       {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig { c := idjag(); c.ResourceClientSecret = schemas.NewSecretVar("rotated"); return c }(), reauth: true},
-		"secret switched to a key":      {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig { c := idjag(); c.ResourceClientSecret = nil; c.ResourcePrivateKey = schemas.NewSecretVar("pem"); return c }(), reauth: true},
+		"resource client ID changed": {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig {
+			c := idjag()
+			c.ResourceClientID = schemas.NewSecretVar("other")
+			return c
+		}(), reauth: true},
+		"resource secret rotated": {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig {
+			c := idjag()
+			c.ResourceClientSecret = schemas.NewSecretVar("rotated")
+			return c
+		}(), reauth: true},
+		"secret switched to a key": {existing: idjag(), file: func() *schemas.MCPTokenExchangeConfig {
+			c := idjag()
+			c.ResourceClientSecret = nil
+			c.ResourcePrivateKey = schemas.NewSecretVar("pem")
+			return c
+		}(), reauth: true},
 	} {
 		store := &reauthRecordingStore{}
 		rotateMCPTokenExchangeConfigFromFile(context.Background(), store, "client-1", "linear", tc.file, tc.existing)
@@ -25893,4 +25906,65 @@ func TestRotateMCPTokenExchangeConfigFromFile_IDJAGFields(t *testing.T) {
 			t.Errorf("%s: marked needs_reauth = %v, want %v", name, got, tc.reauth)
 		}
 	}
+}
+
+func relayNamesInStore(t *testing.T, store configstore.ConfigStore) map[string]*schemas.RelayConfig {
+	t.Helper()
+	cfgs, err := store.ListRelays(context.Background())
+	require.NoError(t, err)
+	out := make(map[string]*schemas.RelayConfig, len(cfgs))
+	for _, cfg := range cfgs {
+		out[cfg.Name] = cfg
+	}
+	return out
+}
+
+func TestLoadRelaysConfig(t *testing.T) {
+	initTestLogger()
+	t.Setenv("TAVILY_KEY", "tvly-from-env")
+	store := createTestSQLiteConfigStore(t, t.TempDir())
+	config := &Config{ConfigStore: store}
+
+	configData := parseConfigData(t, `{
+		"relays": [
+			{"name": "tavily", "base_url": "https://search.example.com", "auth": {"type": "bearer"}, "credential": {"value": "env.TAVILY_KEY"},
+			 "usage": {"cost_per_request": 0.001}, "routes": [{"method": "POST", "path": "/search", "usage": {"units_path": "usage.credits", "cost_per_unit": 0.008}}]},
+			{"name": "broken", "enabled": true, "base_url": "not a url"}
+		]
+	}`)
+	loadRelaysConfig(context.Background(), config, configData)
+	stored := relayNamesInStore(t, store)
+	require.Len(t, stored, 1, "an invalid declaration is skipped")
+	tavily := stored["tavily"]
+	require.NotNil(t, tavily)
+	assert.Equal(t, "tvly-from-env", tavily.Credential.Value.GetValue(), "an env reference resolves")
+	assert.True(t, tavily.Credential.Value.IsFromEnv(), "and stays a reference")
+	require.Len(t, tavily.Routes, 1)
+
+	hashes, err := store.GetRelayConfigHashes(context.Background())
+	require.NoError(t, err)
+	firstHash := hashes["tavily"]
+	require.NotEmpty(t, firstHash)
+	loadRelaysConfig(context.Background(), config, configData)
+	hashes, _ = store.GetRelayConfigHashes(context.Background())
+	assert.Equal(t, firstHash, hashes["tavily"], "an unchanged file rewrites nothing")
+
+	// An endpoint created through the API survives a merge reload, and is pruned only when
+	// config.json is the source of truth and declares the section.
+	require.NoError(t, store.CreateRelay(context.Background(), &schemas.RelayConfig{
+		Name: "from-api", BaseURL: "https://example.com", Auth: schemas.RelayAuthConfig{Type: schemas.RelayAuthNone},
+	}, ""))
+	loadRelaysConfig(context.Background(), config, configData)
+	assert.Len(t, relayNamesInStore(t, store), 2)
+
+	sourceOfTruth := parseConfigData(t, `{
+		"source_of_truth": "config.json",
+		"relays": [
+			{"name": "tavily", "description": "changed", "base_url": "https://search.example.com", "auth": {"type": "bearer"}, "credential": {"value": "env.TAVILY_KEY"}}
+		]
+	}`)
+	loadRelaysConfig(context.Background(), config, sourceOfTruth)
+	stored = relayNamesInStore(t, store)
+	require.Len(t, stored, 1, "the file is the source of truth: the API-created endpoint is pruned")
+	assert.Equal(t, "changed", stored["tavily"].Description, "a changed declaration updates the row")
 }

@@ -72,3 +72,18 @@ func TestRelayPersistence(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 }
+
+func TestVirtualKeyAllowAllRelaysPersists(t *testing.T) {
+	ctx := context.Background()
+	store := setupRDBTestStore(t)
+	require.NoError(t, store.CreateVirtualKey(ctx, &tables.TableVirtualKey{ID: "vk-all", Name: "all", Value: *schemas.NewSecretVar("v-all"), IsActive: schemas.Ptr(true), AllowAllRelays: true}))
+	vk, err := store.GetVirtualKey(ctx, "vk-all")
+	require.NoError(t, err)
+	assert.True(t, vk.AllowAllRelays)
+
+	vk.AllowAllRelays = false
+	require.NoError(t, store.UpdateVirtualKey(ctx, vk))
+	vk, err = store.GetVirtualKey(ctx, "vk-all")
+	require.NoError(t, err)
+	assert.False(t, vk.AllowAllRelays, "an update writes the flag")
+}

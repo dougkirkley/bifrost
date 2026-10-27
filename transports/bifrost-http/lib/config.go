@@ -226,6 +226,7 @@ type ConfigData struct {
 	MCP               *schemas.MCPConfig                    `json:"mcp,omitempty"`
 	Webhooks          []*WebhookEndpointConfig              `json:"webhooks,omitempty"`
 	Agents            []*AgentRegistrationFileConfig        `json:"agents,omitempty"`
+	Relays            []*schemas.RelayConfig                `json:"relays,omitempty"`
 	Governance        *configstore.GovernanceConfig         `json:"governance,omitempty"`
 	VectorStoreConfig *vectorstore.Config                   `json:"vector_store,omitempty"`
 	ConfigStoreConfig *configstore.Config                   `json:"config_store,omitempty"`
@@ -483,6 +484,8 @@ func (cd *ConfigData) sectionPresent(name string) bool {
 		return cd.MCP != nil
 	case "agents":
 		return cd.Agents != nil
+	case "relays":
+		return cd.Relays != nil
 	case "governance":
 		return cd.Governance != nil
 	case "plugins":
@@ -568,6 +571,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		MCP               *schemas.MCPConfig                    `json:"mcp,omitempty"`
 		Webhooks          []*WebhookEndpointConfig              `json:"webhooks,omitempty"`
 		Agents            []*AgentRegistrationFileConfig        `json:"agents,omitempty"`
+		Relays            []*schemas.RelayConfig                `json:"relays,omitempty"`
 		Governance        *configstore.GovernanceConfig         `json:"governance,omitempty"`
 		VectorStoreConfig json.RawMessage                       `json:"vector_store,omitempty"`
 		ConfigStoreConfig json.RawMessage                       `json:"config_store,omitempty"`
@@ -599,6 +603,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 	cd.MCP = temp.MCP
 	cd.Webhooks = temp.Webhooks
 	cd.Agents = temp.Agents
+	cd.Relays = temp.Relays
 	cd.Governance = temp.Governance
 	cd.Plugins = temp.Plugins
 	cd.WebSocket = temp.WebSocket
@@ -767,6 +772,7 @@ type Config struct {
 	LLMPlugins           atomic.Pointer[[]schemas.LLMPlugin]                       // Derived cache (auto-rebuilt)
 	MCPPlugins           atomic.Pointer[[]schemas.MCPPlugin]                       // Derived cache (auto-rebuilt)
 	A2APlugins           atomic.Pointer[[]schemas.A2APlugin]                       // Derived cache (auto-rebuilt)
+	RelayPlugins         atomic.Pointer[[]schemas.RelayPlugin]                     // Derived cache (auto-rebuilt)
 	HTTPTransportPlugins atomic.Pointer[[]schemas.HTTPTransportPlugin]             // Derived cache (auto-rebuilt)
 	ConfigMarshallers    atomic.Pointer[map[string]schemas.ConfigMarshallerPlugin] // Derived cache (auto-rebuilt)
 	PluginLoader         plugins.PluginLoader
@@ -1223,6 +1229,8 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	}
 	// 7. Webhook endpoints
 	loadWebhooksConfig(ctx, config, &configData)
+	// 7a. Relays (before governance, whose virtual keys may grant them)
+	loadRelaysConfig(ctx, config, &configData)
 	// 8. Governance config
 	loadGovernanceConfig(ctx, config, &configData)
 	// 8a. Agent Gateway registrations (after governance so file-declared virtual
@@ -5404,6 +5412,17 @@ func updateGovernanceConfigInStore(
 			if err := config.ConfigStore.UpdateVirtualKey(ctx, &virtualKey, tx); err != nil {
 				return fmt.Errorf("failed to update virtual key %s: %w", virtualKey.ID, err)
 			}
+			// UpdateVirtualKey writes scalar columns only. Grants the file declares replace the stored
+			// ones; a key that omits the field keeps the grants made through the API.
+			if virtualKey.RelayGrants != nil && !governed.skipKeyLimits(virtualKey.ID) {
+				names := make([]string, 0, len(virtualKey.RelayGrants))
+				for _, g := range virtualKey.RelayGrants {
+					names = append(names, g.RelayName)
+				}
+				if err := config.ConfigStore.ReplaceVirtualKeyRelayGrants(ctx, virtualKey.ID, names, tx); err != nil {
+					return fmt.Errorf("failed to update relay grants for virtual key %s: %w", virtualKey.ID, err)
+				}
+			}
 		}
 
 		// virtual_key_id names the key a budget funds; the key's tier owns the row.
@@ -8106,6 +8125,15 @@ func (c *Config) GetLoadedA2APlugins() []schemas.A2APlugin {
 	return nil
 }
 
+// GetLoadedRelayPlugins returns the current snapshot of loaded plugins that see
+// relay calls, with the same lock-free, read-only contract as GetLoadedA2APlugins.
+func (c *Config) GetLoadedRelayPlugins() []schemas.RelayPlugin {
+	if plugins := c.RelayPlugins.Load(); plugins != nil {
+		return slices.Clone(*plugins)
+	}
+	return nil
+}
+
 // GetLoadedHTTPTransportPlugins returns all loaded plugins that implement HTTPTransportPlugin interface.
 // This method returns a cached list that is updated on plugin add/reload/remove operations.
 // It is lock-free and safe for concurrent access from hot paths.
@@ -8128,10 +8156,12 @@ func (c *Config) rebuildInterfaceCaches() {
 		emptyLLM := []schemas.LLMPlugin{}
 		emptyMCP := []schemas.MCPPlugin{}
 		emptyA2A := []schemas.A2APlugin{}
+		emptyEndpoints := []schemas.RelayPlugin{}
 		emptyHTTP := []schemas.HTTPTransportPlugin{}
 		c.LLMPlugins.Store(&emptyLLM)
 		c.MCPPlugins.Store(&emptyMCP)
 		c.A2APlugins.Store(&emptyA2A)
+		c.RelayPlugins.Store(&emptyEndpoints)
 		c.HTTPTransportPlugins.Store(&emptyHTTP)
 		return
 	}
@@ -8140,6 +8170,7 @@ func (c *Config) rebuildInterfaceCaches() {
 	var llm []schemas.LLMPlugin
 	var mcp []schemas.MCPPlugin
 	var a2aPlugins []schemas.A2APlugin
+	var endpointPlugins []schemas.RelayPlugin
 	var httpTransport []schemas.HTTPTransportPlugin
 
 	for _, p := range *basePlugins {
@@ -8151,6 +8182,9 @@ func (c *Config) rebuildInterfaceCaches() {
 		}
 		if a2aPlugin, ok := p.(schemas.A2APlugin); ok {
 			a2aPlugins = append(a2aPlugins, a2aPlugin)
+		}
+		if endpointPlugin, ok := p.(schemas.RelayPlugin); ok {
+			endpointPlugins = append(endpointPlugins, endpointPlugin)
 		}
 		if httpPlugin, ok := p.(schemas.HTTPTransportPlugin); ok {
 			httpTransport = append(httpTransport, httpPlugin)
@@ -8164,6 +8198,7 @@ func (c *Config) rebuildInterfaceCaches() {
 	c.LLMPlugins.Store(&llm)
 	c.MCPPlugins.Store(&mcp)
 	c.A2APlugins.Store(&a2aPlugins)
+	c.RelayPlugins.Store(&endpointPlugins)
 	c.HTTPTransportPlugins.Store(&httpTransport)
 }
 
