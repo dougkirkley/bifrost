@@ -9,6 +9,8 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func createPushFixtureAgent(t *testing.T, store *RDBConfigStore) {
@@ -70,6 +72,78 @@ func TestAgentPushPendingTenantIdentity(t *testing.T) {
 	remaining, err := store.GetAgentPushConfigByIngressTokenHash(ctx, "fixture", "tenant-b")
 	require.NoError(t, err)
 	require.Equal(t, "shared-task", remaining.TaskID)
+}
+
+func TestAgentPushPendingReplacesConfigWithinTenant(t *testing.T) {
+	store := setupRDBTestStore(t)
+	createPushFixtureAgent(t, store)
+	ctx := t.Context()
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		require.NoError(t, store.SaveAgentPushConfig(ctx, &schemas.AgentPushConfig{
+			AgentName: "fixture", Tenant: tenant, TenantBound: true, TaskID: "task", ConfigID: "config",
+			URL: "https://" + tenant + ".example", IngressTokenHash: tenant,
+		}))
+	}
+	pending := &schemas.AgentPushConfig{AgentName: "fixture", Tenant: "tenant-a", TenantBound: true,
+		TaskID: "__bifrost_pending__:send", ConfigID: "config", URL: "https://replacement.example",
+		IngressTokenHash: "replacement", Token: &schemas.SecretVar{Val: "replacement-secret", SecretType: schemas.SecretTypePlainText},
+	}
+	require.NoError(t, store.SaveAgentPushConfig(ctx, pending))
+	var before, after string
+	require.NoError(t, store.DB().Table("config_agent_push_configs").Select("token").Where("ingress_token_hash = ?", "replacement").Scan(&before).Error)
+	require.NoError(t, store.BindAgentPushConfigTask(ctx, "fixture", "replacement", pending.TaskID, "task"))
+	bound, err := store.GetAgentPushConfig(ctx, "fixture", "tenant-a", "task", "config")
+	require.NoError(t, err)
+	require.Equal(t, pending.URL, bound.URL)
+	require.Equal(t, "replacement", bound.IngressTokenHash)
+	require.Equal(t, "replacement-secret", bound.Token.GetValue())
+	require.NoError(t, store.DB().Table("config_agent_push_configs").Select("token").Where("ingress_token_hash = ?", "replacement").Scan(&after).Error)
+	require.Equal(t, before, after, "binding must preserve the stored credential bytes")
+	other, err := store.GetAgentPushConfig(ctx, "fixture", "tenant-b", "task", "config")
+	require.NoError(t, err)
+	require.Equal(t, "tenant-b", other.IngressTokenHash)
+	missing, err := store.GetAgentPushConfigByIngressTokenHash(ctx, "fixture", "tenant-a")
+	require.NoError(t, err)
+	require.Nil(t, missing, "the replaced registration's credential must be revoked")
+	bound.IngressTokenHash = "newer"
+	require.NoError(t, store.SaveAgentPushConfig(ctx, bound))
+	require.NoError(t, store.BindAgentPushConfigTask(ctx, "fixture", "replacement", pending.TaskID, "task"))
+	current, err := store.GetAgentPushConfig(ctx, "fixture", "tenant-a", "task", "config")
+	require.NoError(t, err)
+	require.Equal(t, "newer", current.IngressTokenHash, "a late settlement must not remove a newer registration")
+	pending.TaskID = "__bifrost_pending__:legacy"
+	pending.IngressTokenHash = "legacy"
+	pending.TenantBound = false
+	require.NoError(t, store.SaveAgentPushConfig(ctx, pending))
+	require.Error(t, store.BindAgentPushConfigTask(ctx, "fixture", "legacy", pending.TaskID, "task"))
+	current, err = store.GetAgentPushConfig(ctx, "fixture", "tenant-a", "task", "config")
+	require.NoError(t, err)
+	require.Equal(t, "newer", current.IngressTokenHash, "ambiguous legacy ownership must not replace a bound registration")
+}
+
+func BenchmarkAgentPushRegistrationBinding(b *testing.B) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(b, err)
+	connection, err := db.DB()
+	require.NoError(b, err)
+	connection.SetMaxOpenConns(1)
+	b.Cleanup(func() { _ = connection.Close() })
+	require.NoError(b, db.AutoMigrate(&tables.TableAgentRegistration{}, &tables.TableAgentPushConfig{}))
+	require.NoError(b, db.Create(&tables.TableAgentRegistration{Name: "fixture", AgentCardURL: "https://agent.example"}).Error)
+	store := &RDBConfigStore{}
+	store.db.Store(db)
+	ctx := context.Background()
+	config := &schemas.AgentPushConfig{AgentName: "fixture", Tenant: "tenant", TenantBound: true,
+		TaskID: "__bifrost_pending__:send", ConfigID: "config", URL: "https://callback.example", IngressTokenHash: "hash",
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		require.NoError(b, store.SaveAgentPushConfig(ctx, config))
+		require.NoError(b, store.BindAgentPushConfigTask(ctx, "fixture", "hash", config.TaskID, "task"))
+		_, err := store.DeleteAgentPushConfig(ctx, "fixture", "tenant", "task", "config")
+		require.NoError(b, err)
+	}
 }
 
 func TestAgentPushDeleteFencesReplacement(t *testing.T) {

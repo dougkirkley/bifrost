@@ -67,11 +67,38 @@ func (s *RDBConfigStore) SaveAgentPushConfig(ctx context.Context, config *schema
 
 // BindAgentPushConfigTask attaches a task id to the exact pending embedded
 // push config identified by its ingress token hash and internal pending task id.
-// A row already bound by another path is left untouched.
+// It replaces an existing registration in that tenant, just like an explicit
+// create. A row already bound by another path is left untouched.
 func (s *RDBConfigStore) BindAgentPushConfigTask(ctx context.Context, agentName, ingressTokenHash, pendingTaskID, taskID string) error {
-	return s.DB().WithContext(ctx).Model(&tables.TableAgentPushConfig{}).
-		Where("agent_name = ? AND ingress_token_hash = ? AND task_id = ?", agentName, ingressTokenHash, pendingTaskID).
-		Updates(map[string]any{"task_id": taskID, "updated_at": time.Now().UTC()}).Error
+	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// SQLite starts IMMEDIATE transactions; Postgres locks the pending row.
+		// Lock only the pending identity; loading the full model would decrypt
+		// credentials that must remain unchanged during binding.
+		var pending struct {
+			Tenant, ConfigID string
+			TenantBound      bool
+		}
+		err := tx.Table("config_agent_push_configs").Select("tenant, config_id, tenant_bound").
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("agent_name = ? AND ingress_token_hash = ? AND task_id = ?", agentName, ingressTokenHash, pendingTaskID).
+			Take(&pending).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		// A legacy pending row may carry an unrelated child tenant. Preserve
+		// its old, fail-closed collision behavior rather than replacing that tenant.
+		if pending.TenantBound {
+			if err := tx.Delete(&tables.TableAgentPushConfig{}, "agent_name = ? AND tenant = ? AND task_id = ? AND config_id = ?", agentName, pending.Tenant, taskID, pending.ConfigID).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&tables.TableAgentPushConfig{}).
+			Where("agent_name = ? AND ingress_token_hash = ? AND task_id = ?", agentName, ingressTokenHash, pendingTaskID).
+			Updates(map[string]any{"task_id": taskID, "updated_at": time.Now().UTC()}).Error
+	})
 }
 
 // GetAgentPushConfig loads one push config; a missing row is reported as

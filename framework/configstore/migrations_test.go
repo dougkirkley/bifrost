@@ -108,6 +108,16 @@ func TestAgentPushTenantMigration(t *testing.T) {
 			current, err := store.GetAgentPushConfig(context.Background(), "fixture", "tenant-b", "task", "config")
 			require.NoError(t, err)
 			require.True(t, current.TenantBound)
+			updatedConfig := *current
+			updatedConfig.TaskID = "__bifrost_pending__:update"
+			updatedConfig.URL = "https://updated.example"
+			updatedConfig.IngressTokenHash = "updated-hash"
+			require.NoError(t, store.SaveAgentPushConfig(context.Background(), &updatedConfig))
+			require.NoError(t, store.BindAgentPushConfigTask(context.Background(), "fixture", updatedConfig.IngressTokenHash, updatedConfig.TaskID, "task"))
+			current, err = store.GetAgentPushConfig(context.Background(), "fixture", "tenant-b", "task", "config")
+			require.NoError(t, err)
+			require.Equal(t, updatedConfig.URL, current.URL)
+			require.Equal(t, updatedConfig.IngressTokenHash, current.IngressTokenHash)
 			var count int64
 			require.NoError(t, db.Table("config_agent_push_configs").Count(&count).Error)
 			require.EqualValues(t, 2, count)
