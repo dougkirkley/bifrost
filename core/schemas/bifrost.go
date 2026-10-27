@@ -28,6 +28,7 @@ type BifrostConfig struct {
 	LLMPlugins         []LLMPlugin
 	MCPPlugins         []MCPPlugin
 	A2APlugins         []A2APlugin
+	RelayPlugins       []RelayPlugin
 	OAuth2Provider     OAuth2Provider
 	MCPHeadersProvider MCPHeadersProvider // Backend for MCPAuthTypePerUserHeaders credential storage; nil disables per-user-headers auth (resolver errors at use)
 	Logger             Logger
