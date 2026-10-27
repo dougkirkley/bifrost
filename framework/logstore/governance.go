@@ -128,3 +128,26 @@ func applyGovernanceContext(ctx *schemas.BifrostContext, target governanceSnapsh
 		}
 	}
 }
+
+// ApplyGovernanceContext records the request's governance attribution on a Relay Logs row: the
+// virtual key, user, team, customer, business unit and project, and the budgets and rate limits the
+// call was charged against. The multi-valued team, customer and business unit sets are not stored on
+// this table; the primary of each is.
+func (l *RelayLog) ApplyGovernanceContext(ctx *schemas.BifrostContext) {
+	if l == nil {
+		return
+	}
+	var teamIDs, teamNames, customerIDs, customerNames, businessUnitIDs, businessUnitNames []string
+	applyGovernanceContext(ctx, governanceSnapshotTarget{
+		virtualKeyID: &l.VirtualKeyID, virtualKeyName: &l.VirtualKeyName,
+		userID: &l.UserID, userName: &l.UserName,
+		teamID: &l.TeamID, teamName: &l.TeamName,
+		customerID: &l.CustomerID, customerName: &l.CustomerName,
+		businessUnitID: &l.BusinessUnitID, businessUnitName: &l.BusinessUnitName,
+		projectID: &l.ProjectID, projectName: &l.ProjectName,
+		teamIDs: &teamIDs, teamNames: &teamNames,
+		customerIDs: &customerIDs, customerNames: &customerNames,
+		businessUnitIDs: &businessUnitIDs, businessUnitNames: &businessUnitNames,
+		budgetIDs: &l.BudgetIDsParsed, rateLimitIDs: &l.RateLimitIDsParsed,
+	})
+}

@@ -86,6 +86,9 @@ type Permit struct {
 	mcpPermits        []schemas.MCPPermit
 	agentPermits      []string
 	allowAllProviders bool
+
+	relayPermits   []string
+	allowAllRelays bool
 }
 
 // PermitOption configures a Permit at construction. Options keep NewPermit's required arguments
@@ -96,6 +99,17 @@ type PermitOption func(*Permit)
 // WithAgentPermits grants the named Agent Gateway registrations.
 func WithAgentPermits(agentNames []string) PermitOption {
 	return func(p *Permit) { p.agentPermits = slices.Clone(agentNames) }
+}
+
+// WithRelayPermits grants the named relays.
+func WithRelayPermits(endpointNames []string) PermitOption {
+	return func(p *Permit) { p.relayPermits = slices.Clone(endpointNames) }
+}
+
+// WithAllowAllRelays grants every relay, including ones the permit
+// names no permit for.
+func WithAllowAllRelays(allow bool) PermitOption {
+	return func(p *Permit) { p.allowAllRelays = allow }
 }
 
 // WithAllowAllProviders grants every provider, including ones the permit holds no provider permit
@@ -225,6 +239,19 @@ func (p *Permit) AllowsAllProviders() bool {
 	return p != nil && p.allowAllProviders
 }
 
+// RelayPermits implements schemas.Permit. See ProviderPermits for why this returns a copy.
+func (p *Permit) RelayPermits() []string {
+	if p == nil {
+		return nil
+	}
+	return slices.Clone(p.relayPermits)
+}
+
+// AllowsAllRelays implements schemas.Permit.
+func (p *Permit) AllowsAllRelays() bool {
+	return p != nil && p.allowAllRelays
+}
+
 // The rules below are written against schemas.Permit rather than *Permit, so the fold asks every
 // permit it holds the same questions whichever implementation answers them.
 
@@ -264,6 +291,14 @@ func blacklistsModel(p schemas.Permit, provider string, model string) bool {
 
 func allowsAgent(p schemas.Permit, agentName string) bool {
 	return !isNilPermit(p) && slices.Contains(p.AgentPermits(), agentName)
+}
+
+// allowsRelay reports whether the permit grants every endpoint or names this one.
+func allowsRelay(p schemas.Permit, endpointName string) bool {
+	if isNilPermit(p) {
+		return false
+	}
+	return p.AllowsAllRelays() || slices.Contains(p.RelayPermits(), endpointName)
 }
 
 // allowsTool reports whether the permit permits toolPattern. The MCP permit that holds a client

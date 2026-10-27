@@ -1291,6 +1291,7 @@ type LoggerPlugin struct {
 	pendingMCPLogsToInject       sync.Map                       // Maps mcpLogID -> *logstore.MCPToolLog (PreMCPHook input data awaiting PostMCPHook)
 	provisionalMCPArguments      sync.Map                       // Maps mcpLogID -> tool arguments captured before governance stamped the presented key or named project; attached in PostMCPHook only if content ends up visible
 	pendingAgentLogs             sync.Map                       // Maps request/operation key -> *logstore.AgentLog awaiting PostA2AHook
+	pendingEndpointLogs          sync.Map                       // Maps request id -> *logstore.RelayLog awaiting PostRelayHook
 	pendingAgentLogsToInject     sync.Map                       // Maps traceID -> *pendingAgentInjectEntries (A2A request rows awaiting Inject latency backfill)
 	writerConfig                 logstore.WriterConfig          // Resolved async writer queue and batch settings
 	writeQueue                   chan *writeQueueEntry          // Buffered channel for batch write queue

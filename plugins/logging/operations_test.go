@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore"
 	cstables "github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/grant"
 	"github.com/maximhq/bifrost/framework/jobaccounting"
@@ -5247,4 +5248,125 @@ func TestA2ARawCaptureContentPolicy(t *testing.T) {
 			require.Equal(t, "cmVzcG9uc2U=", *entry.RawResponse)
 		}
 	}
+}
+
+// endpointJobStore is the slice of the job store recordEndpointJob uses.
+type endpointJobStore struct {
+	jobaccounting.SweepStore
+	jobs map[string]*cstables.TableProviderJob
+	fail error // returned by every lookup
+}
+
+func (s *endpointJobStore) GetProviderJob(_ context.Context, id string) (*cstables.TableProviderJob, error) {
+	if s.fail != nil {
+		return nil, s.fail
+	}
+	job, ok := s.jobs[id]
+	if !ok {
+		return nil, configstore.ErrNotFound
+	}
+	return job, nil
+}
+
+func (s *endpointJobStore) UpsertProviderJob(_ context.Context, job *cstables.TableProviderJob) error {
+	if _, ok := s.jobs[job.ID]; !ok {
+		copied := *job
+		if copied.AccountingStatus == "" {
+			copied.AccountingStatus = cstables.ProviderJobAccountingStatusPending
+		}
+		s.jobs[job.ID] = &copied
+	}
+	return nil
+}
+
+func TestRelayLogRow(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 4)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-pte")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyName, "prod")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBudgetIDs, []string{"budget-1"})
+
+	_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{
+		RelayName: "tavily", Method: "POST", Path: "/search", RawQuery: "q=1", RoutePath: "/search", Billable: true,
+		Headers: map[string]string{"content-type": "application/json", "x-api-key": "tvly-secret"}, Body: []byte(`{"query":"x"}`),
+	})
+	require.NoError(t, err)
+	_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{
+		RelayName: "tavily", StatusCode: 200, Latency: 120, BytesOut: 42, Body: []byte(`{"usage":{"credits":4}}`),
+		Usage: &schemas.RelayUsage{Cost: 0.033, CostPerRequest: 0.001, CostPerUnit: 0.008, Units: schemas.Ptr(4.0), BilledUnits: schemas.Ptr(4.0)},
+	}, nil)
+	require.NoError(t, err)
+
+	entry := (<-plugin.writeQueue).endpointLog
+	require.NotNil(t, entry)
+	require.Equal(t, "req-pte", entry.RequestID)
+	require.NotEqual(t, "req-pte", entry.ID, "the row id is generated: a caller's x-request-id may repeat")
+	require.Equal(t, "/search?q=1", entry.Path)
+	require.Equal(t, logstore.RelayLogStatusSuccess, entry.Status)
+	require.InDelta(t, 0.033, *entry.Cost, 1e-12)
+	require.InDelta(t, 4, *entry.BilledUnits, 1e-12)
+	require.Equal(t, "vk-1", *entry.VirtualKeyID)
+	require.Equal(t, "prod", *entry.VirtualKeyName)
+	require.Equal(t, []string{"budget-1"}, entry.BudgetIDsParsed)
+	require.Equal(t, `{"query":"x"}`, *entry.RequestBody)
+	require.NotEqual(t, "tvly-secret", entry.RequestHeadersParsed["x-api-key"], "credential headers are redacted before they are stored")
+
+	// Content logging off: the row keeps the charge and drops the bodies and headers.
+	hidden := policyTestPlugin(boolPtr(true), nil, false)
+	hidden.writeQueue = make(chan *writeQueueEntry, 1)
+	ctx = policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-hidden")
+	_, _, err = hidden.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search", RawQuery: "q=private-text", Body: []byte(`secret`)})
+	require.NoError(t, err)
+	_, _, err = hidden.PostRelayHook(ctx, &schemas.BifrostRelayResponse{StatusCode: 502}, nil)
+	require.NoError(t, err)
+	entry = (<-hidden.writeQueue).endpointLog
+	require.Nil(t, entry.RequestBody)
+	require.Equal(t, "/search", entry.Path, "query values are caller content and are dropped with it")
+	require.Equal(t, logstore.RelayLogStatusError, entry.Status)
+}
+
+func TestRelayLogQueryRedaction(t *testing.T) {
+	got := redactQuery("q=private-search&api_key=sk-123&access_token=tok&page=2&Signature=abc&flag")
+	require.NotContains(t, got, "sk-123")
+	require.NotContains(t, got, "tok&")
+	require.NotContains(t, got, "abc")
+	require.Contains(t, got, "q=private-search", "ordinary parameters are kept")
+	require.Contains(t, got, "page=2")
+	require.True(t, strings.HasSuffix(got, "&flag"), "a parameter without a value is kept as is")
+}
+
+func TestRelayJobRowDedupesIdempotentStarts(t *testing.T) {
+	store := &endpointJobStore{jobs: map[string]*cstables.TableProviderJob{}}
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.batchStore = store
+	job := &schemas.RelayJobHandle{ID: "j-1", IntervalSeconds: 30, Params: `{"job":{}}`}
+
+	first := &logstore.RelayLog{ID: "req-1", RequestID: "req-1", RelayName: "textract", BudgetIDsParsed: []string{"budget-1"}}
+	plugin.recordEndpointJob(first, job)
+	require.Len(t, store.jobs, 1)
+	var row *cstables.TableProviderJob
+	for _, r := range store.jobs {
+		row = r
+	}
+	require.Equal(t, "textract", row.Provider)
+	require.Equal(t, cstables.ProviderJobKindRelay, row.Kind)
+	require.Equal(t, "j-1", schemas.RelayUpstreamJobID(row.JobID))
+	require.Equal(t, `["budget-1"]`, *row.BudgetIDs)
+	require.Equal(t, "req-1", *row.SourceLogID)
+
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-2", RequestID: "req-2", RelayName: "textract"}, job)
+	require.Len(t, store.jobs, 1, "a retried start while the job is open records nothing new")
+
+	row.AccountingStatus = cstables.ProviderJobAccountingStatusAccounted
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-3", RequestID: "req-3", RelayName: "textract"}, job)
+	require.Len(t, store.jobs, 2, "an id reused after settlement is a new job")
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-4", RequestID: "req-4", RelayName: "textract"}, job)
+	require.Len(t, store.jobs, 2, "a retried start of the reused job dedupes against its slot")
+
+	store.fail = errors.New("database is down")
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-5", RequestID: "req-5", RelayName: "textract"}, &schemas.RelayJobHandle{ID: "j-2", Params: `{"job":{}}`})
+	require.Len(t, store.jobs, 2, "a lookup error records nothing rather than risk a duplicate row")
 }
