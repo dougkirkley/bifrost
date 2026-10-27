@@ -55,6 +55,7 @@ import {
 	Wallet,
 	WalletCards,
 	Webhook,
+	Waypoints,
 } from "lucide-react";
 
 import { WarpIcon } from "@/components/ui/icons";
@@ -168,7 +169,13 @@ const getSidebarItemHref = (item: Pick<SidebarItem, "url" | "queryParam">) => {
 
 const slug = (s: string) => s.toLowerCase().replace(/\s+/g, "-");
 
-const TimeFilterPages = new Set(["/workspace/dashboard", "/workspace/logs", "/workspace/mcp-logs", "/workspace/agent-logs"]);
+const TimeFilterPages = new Set([
+	"/workspace/dashboard",
+	"/workspace/logs",
+	"/workspace/mcp-logs",
+	"/workspace/agent-logs",
+	"/workspace/relay-logs",
+]);
 
 const preserveTimeFilters = (baseHref: string, subItemUrl: string, pathname: string, search: string): string => {
 	if (TimeFilterPages.has(subItemUrl) && TimeFilterPages.has(pathname)) {
@@ -714,6 +721,13 @@ export default function AppSidebar() {
 						hasAccess: hasAgentLogsAccess,
 					},
 					{
+						title: "Relay Logs",
+						url: "/workspace/relay-logs",
+						icon: Waypoints,
+						description: "Relay calls and their cost",
+						hasAccess: hasLogsAccess,
+					},
+					{
 						title: "Connectors",
 						url: "/workspace/observability",
 						icon: ChevronsLeftRightEllipsis,
@@ -877,6 +891,13 @@ export default function AppSidebar() {
 						hasAccess: hasSettingsAccess,
 					},
 				],
+			},
+			{
+				title: "Relays",
+				url: "/workspace/relays",
+				icon: Waypoints,
+				description: "Relay non-LLM APIs with per-route pricing",
+				hasAccess: hasModelProvidersAccess,
 			},
 			{
 				title: "Plugins",

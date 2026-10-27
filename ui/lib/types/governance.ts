@@ -105,6 +105,8 @@ export interface VirtualKey {
 	provider_configs?: VirtualKeyProviderConfig[];
 	mcp_configs?: VirtualKeyMCPConfig[];
 	agent_grants?: VirtualKeyAgentGrant[];
+	allow_all_relays?: boolean;
+	relay_grants?: { relay_name: string }[];
 	// Virtual MCPs this key is assigned to. Populated by the single-VK GET, not the list.
 	virtual_mcp_ids?: number[];
 	team_id?: string;
@@ -249,6 +251,8 @@ export interface CreateVirtualKeyRequest {
 	provider_configs?: VirtualKeyProviderConfigRequest[];
 	mcp_configs?: VirtualKeyMCPConfigRequest[];
 	agent_grants?: { agent_name: string }[];
+	allow_all_relays?: boolean;
+	relay_grants?: { relay_name: string }[];
 	team_id?: string;
 	customer_id?: string;
 	// Third owner, mutually exclusive with team_id and customer_id (enterprise).
@@ -270,6 +274,8 @@ export interface UpdateVirtualKeyRequest {
 	provider_configs?: VirtualKeyProviderConfigUpdateRequest[];
 	mcp_configs?: VirtualKeyMCPConfigRequest[];
 	agent_grants?: { agent_name: string }[];
+	allow_all_relays?: boolean;
+	relay_grants?: { relay_name: string }[];
 	team_id?: string | null;
 	customer_id?: string | null;
 	// Third owner, mutually exclusive with team_id and customer_id (enterprise); null clears it.
